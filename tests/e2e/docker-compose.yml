@@ -16,6 +16,26 @@ services:
       SUDO_ACCESS: "true"
     networks: [e2e]
 
+  # Passwordless-sudo target (built from tests/sudo-server). Same base as
+  # sshd-pass but with a NOPASSWD sudoers rule, so the SFTP sudo-mode toggle
+  # (`sudo -n sftp-server`) succeeds here. sshd-pass, by contrast, keeps
+  # password-prompting sudo and exercises the toggle's failure path.
+  sshd-sudo:
+    build:
+      context: ../sudo-server
+      dockerfile: Dockerfile
+    image: anyscp-test-sudo:latest
+    container_name: anyscp-e2e-sshd-sudo
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Etc/UTC
+      USER_NAME: testuser
+      USER_PASSWORD: testpass
+      PASSWORD_ACCESS: "true"
+      SUDO_ACCESS: "true"
+    networks: [e2e]
+
   sshd-key:
     image: lscr.io/linuxserver/openssh-server:latest
     container_name: anyscp-e2e-sshd-key
@@ -133,6 +153,8 @@ services:
     depends_on:
       sshd-pass:
         condition: service_started
+      sshd-sudo:
+        condition: service_started
       sshd-key:
         condition: service_started
       sshd-scp:
@@ -144,6 +166,8 @@ services:
     environment:
       SSHD_PASS_HOST: sshd-pass
       SSHD_PASS_PORT: "2222"
+      SSHD_SUDO_HOST: sshd-sudo
+      SSHD_SUDO_PORT: "2222"
       SSHD_KEY_HOST: sshd-key
       SSHD_KEY_PORT: "2222"
       SSHD_SCP_HOST: sshd-scp
