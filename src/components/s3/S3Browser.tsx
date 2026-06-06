@@ -262,17 +262,19 @@ export function S3Browser({ sessionId, isActive = true }: S3BrowserProps) {
       const savePath = await save({ defaultPath: entry.name, title: `Download "${entry.name}"` });
       if (!savePath) return;
 
-      const lastSlash = savePath.lastIndexOf("/");
-      const localDir = lastSlash > 0 ? savePath.substring(0, lastSlash) : savePath;
-
+      // Download to the user-chosen (possibly renamed) path THROUGH the transfer
+      // pipeline, so it streams to disk, shows progress, and is cancellable — and
+      // any failure surfaces in the transfers panel instead of being dropped.
       const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("s3_enqueue_download", {
+      await invoke("s3_enqueue_download_as", {
         s3SessionId: sessionId,
-        keys: [entry.id],
-        localDir,
+        key: entry.id,
+        localPath: savePath,
       });
-    } catch { /* best-effort */ }
-  }, [sessionId]);
+    } catch (err) {
+      setError(sessionId, err instanceof Error ? err.message : String(err));
+    }
+  }, [sessionId, setError]);
 
   // ─── Upload (dialog, enqueue) ─────────────────────────────────────────────
 
