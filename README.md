@@ -12,6 +12,7 @@
   <a href="#installation">Installation</a> &bull;
   <a href="#building">Building</a> &bull;
   <a href="#contributing">Contributing</a> &bull;
+  <a href="https://discord.gg/8UuzYeNVAR">Discord</a> &bull;
   <a href="#license">License</a>
 </p>
 
@@ -21,6 +22,7 @@
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue" alt="Platform"/>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License MIT"/></a>
   <a href="https://github.com/macnev2013/anySCP/stargazers"><img src="https://img.shields.io/github/stars/macnev2013/anySCP?style=social" alt="Stars"/></a>
+  <a href="https://discord.gg/8UuzYeNVAR"><img src="https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
 <p align="center">
@@ -267,6 +269,7 @@ This project is licensed under the MIT License -- see the [LICENSE](LICENSE) fil
 
 ## 💬 Support
 
+- **Discord**: [Join our community](https://discord.gg/8UuzYeNVAR)
 - **Issues**: [GitHub Issues](https://github.com/macnev2013/anySCP/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/macnev2013/anySCP/discussions)
 
