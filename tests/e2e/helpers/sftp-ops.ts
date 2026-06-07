@@ -127,6 +127,45 @@ export async function multiSelectAndDelete(names: string[]): Promise<void> {
     for (const name of names) await assertEntryAbsent(name);
 }
 
+/** Read the displayed rwx permission string of an entry (e.g. "rw-r--r--"),
+ *  or null if the entry/permissions cell isn't present. */
+export async function entryPermissions(name: string): Promise<string | null> {
+    return await browser.execute((n: string) => {
+        const row = document.querySelector(`[data-entry-name='${n}']`);
+        const cell = row?.querySelector("[data-entry-perms]");
+        return cell?.getAttribute("data-entry-perms") ?? null;
+    }, name);
+}
+
+/** Change an entry's permissions via the __e2eExplorerChmod(name, mode) hook
+ *  (which drives onApplyPermissions → sftp_chmod → directory refresh), then
+ *  wait until the listing reflects the expected rwx string. `mode` is octal. */
+export async function setPermissions(
+    name: string,
+    mode: number,
+    expectedDisplay: string,
+): Promise<void> {
+    await waitForEntry(name);
+    await browser.execute(
+        (n: string, m: number) => {
+            const fn = (window as unknown as {
+                __e2eExplorerChmod?: (n: string, m: number) => Promise<void> | undefined;
+            }).__e2eExplorerChmod;
+            if (!fn) throw new Error("__e2eExplorerChmod not registered");
+            void fn(n, m);
+        },
+        name,
+        mode,
+    );
+    await browser.waitUntil(
+        async () => (await entryPermissions(name)) === expectedDisplay,
+        {
+            timeout: 10_000,
+            timeoutMsg: `entry '${name}' permissions never became '${expectedDisplay}'`,
+        },
+    );
+}
+
 /** Read the current order of entries in the listing (top to bottom). */
 export async function entryOrder(): Promise<string[]> {
     return await browser.execute(() => {

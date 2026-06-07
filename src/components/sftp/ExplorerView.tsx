@@ -423,6 +423,13 @@ export function ExplorerView({ sessionId, transport = "sftp", isActive = true }:
     }
   }, [sessionId, transport, session, loadDirectory]);
 
+  // ─── Change permissions (chmod) ─────────────────────────────────────────────
+
+  const handleApplyPermissions = useCallback(async (entry: ExplorerEntry, mode: number) => {
+    await explorerInvoke(transport, "chmod", sessionId, { path: entry.id, mode });
+    if (session) await loadDirectory(session.currentPath);
+  }, [sessionId, transport, session, loadDirectory]);
+
   // ─── Edit in external editor ───────────────────────────────────────────────
 
   const handleEditInEditor = useCallback((entry: ExplorerEntry, editor?: EditorConfig) => {
@@ -595,6 +602,7 @@ export function ExplorerView({ sessionId, transport = "sftp", isActive = true }:
         onDelete={handleDelete}
         onRename={handleRename}
         onEditInEditor={handleEditInEditor}
+        onApplyPermissions={handleApplyPermissions}
         creatingFile={creatingFile}
         onCreateFile={(name) => void handleCreateFile(name)}
         onCancelCreateFile={() => setCreatingFile(false)}
@@ -604,6 +612,7 @@ export function ExplorerView({ sessionId, transport = "sftp", isActive = true }:
         onPaste={() => void handlePaste()}
         onMoveEntries={handleMoveEntries}
         onCopyEntries={handleCopyEntries}
+        currentPath={session.currentPath}
         loading={session.loading}
         busy={busy}
       />

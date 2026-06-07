@@ -444,6 +444,7 @@ export function S3Browser({ sessionId, isActive = true }: S3BrowserProps) {
         creatingFolder={creatingFolder}
         onCreateFolder={(name) => void handleCreateFolder(name)}
         onCancelCreateFolder={() => setCreatingFolder(false)}
+        currentPath={session.currentPrefix}
         loading={session.loading}
       />
 

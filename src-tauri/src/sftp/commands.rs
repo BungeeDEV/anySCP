@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use russh_sftp::protocol::OpenFlags;
+use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -424,6 +424,63 @@ pub async fn sftp_rename(
         crate::telemetry::capture("sftp_entry_renamed", serde_json::json!({}));
     }
     result
+}
+
+/// Change the Unix permission bits (chmod) of a remote path via SFTP `setstat`.
+///
+/// `mode` is the octal permission value as a plain number (e.g. `0o755` = 493).
+/// Only the lower 12 bits (permission + setuid/setgid/sticky) are applied; the
+/// file-type bits are masked off so the server preserves the entry's type.
+#[tauri::command]
+#[instrument(skip(sftp_manager), fields(sftp_session_id = %sftp_session_id, path = %path, mode = mode))]
+pub async fn sftp_chmod(
+    sftp_session_id: String,
+    path: String,
+    mode: u32,
+    sftp_manager: State<'_, Arc<SftpManager>>,
+) -> Result<(), SftpError> {
+    let sftp_arc = {
+        let session_ref = sftp_manager.get_session(&sftp_session_id)?;
+        session_ref.sftp.clone()
+    };
+
+    let requested = mode & 0o7777;
+    let attrs = FileAttributes {
+        permissions: Some(requested),
+        ..Default::default()
+    };
+
+    let sftp = sftp_arc.lock().await;
+    match sftp.set_metadata(&path, attrs).await {
+        Ok(_) => {
+            crate::telemetry::capture("sftp_chmod", serde_json::json!({}));
+            Ok(())
+        }
+        Err(e) => {
+            // Known server quirk: some SFTP server implementations actually
+            // apply the chmod but still reply with a non-Ok status (notably
+            // SSH_FX_PERMISSION_DENIED / SSH_FX_FAILURE), producing a false
+            // positive error. Before surfacing it, re-stat the path and treat
+            // the operation as successful if the permission bits already match
+            // what we requested.
+            match sftp.metadata(&path).await {
+                Ok(current) if (current.permissions.unwrap_or(0) & 0o7777) == requested => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %path,
+                        "setstat returned an error but permissions match the request; \
+                         treating as success"
+                    );
+                    crate::telemetry::capture(
+                        "sftp_chmod",
+                        serde_json::json!({ "false_positive": true }),
+                    );
+                    Ok(())
+                }
+                _ => Err(SftpError::RemoteIoError(e.to_string())),
+            }
+        }
+    }
 }
 
 // ─── Transfers ───────────────────────────────────────────────────────────────

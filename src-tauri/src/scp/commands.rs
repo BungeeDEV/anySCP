@@ -196,6 +196,24 @@ pub async fn scp_rename(
     result
 }
 
+/// Change the Unix permission bits (chmod) of a remote path by exec'ing
+/// `chmod` on the shared SSH connection. Mirrors `sftp_chmod`.
+#[tauri::command]
+#[instrument(skip(scp_manager), fields(scp_session_id = %scp_session_id, path = %path, mode = mode))]
+pub async fn scp_chmod(
+    scp_session_id: String,
+    path: String,
+    mode: u32,
+    scp_manager: State<'_, Arc<ScpManager>>,
+) -> Result<(), ScpError> {
+    let handle = handle_for(&scp_manager, &scp_session_id)?;
+    let result = exec::chmod(handle, &path, mode).await;
+    if result.is_ok() {
+        crate::telemetry::capture("scp_chmod", serde_json::json!({}));
+    }
+    result
+}
+
 // ─── Copy / Move ──────────────────────────────────────────────────────────────
 
 /// Join a directory and a (deduplicated) entry name.

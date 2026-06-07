@@ -175,6 +175,7 @@ pub fn run() {
             sftp::commands::sftp_create_file,
             sftp::commands::sftp_delete,
             sftp::commands::sftp_rename,
+            sftp::commands::sftp_chmod,
             // SFTP — copy / move
             sftp::commands::sftp_move_entries,
             sftp::commands::sftp_copy_entries,
@@ -200,6 +201,7 @@ pub fn run() {
             scp::commands::scp_create_file,
             scp::commands::scp_delete,
             scp::commands::scp_rename,
+            scp::commands::scp_chmod,
             // SCP — copy / move
             scp::commands::scp_move_entries,
             scp::commands::scp_copy_entries,

@@ -199,6 +199,18 @@ pub async fn copy(
     Ok(())
 }
 
+/// `chmod <octal> <path>`. `mode` is the octal permission value as a plain
+/// number; only the lower 12 bits are applied (masked to `0o7777`).
+pub async fn chmod(
+    handle: Arc<Mutex<Handle<SshClientHandler>>>,
+    path: &str,
+    mode: u32,
+) -> Result<(), ScpError> {
+    let cmd = format!("chmod {:o} -- {}", mode & 0o7777, shell_quote(path));
+    ssh_exec_ok(handle, &cmd).await?;
+    Ok(())
+}
+
 /// Detect the remote's userland once. GNU has `find -printf`; busybox lacks
 /// it but keeps `stat -c`; BSD/macOS have neither but have `stat -f`.
 ///
