@@ -3,7 +3,7 @@ import { useSettingsStore } from "../../stores/settings-store";
 import { CustomSelect, type SelectOption } from "../shared/CustomSelect";
 import { useUpdaterStore } from "../../stores/updater-store";
 import { toast } from "../../stores/toast-store";
-import { RefreshCw, CheckCircle2, AlertCircle, Palette, SquareTerminal, ArrowUpDown, Info, ExternalLink, Check, FileCode, Plus, Trash2, FolderOpen, Star, Search } from "lucide-react";
+import { RefreshCw, CheckCircle2, AlertCircle, Palette, SquareTerminal, ArrowUpDown, Info, ExternalLink, Check, FileCode, Plus, Trash2, FolderOpen, Star, Search, Database, Download, Upload, ShieldCheck } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { CursorStyle, ThemeMode, EditorConfig } from "../../stores/settings-store";
 
@@ -45,13 +45,14 @@ const REPO_URL = "https://github.com/macnev2013/anySCP";
 // Each settings category is a section here. To add a new category, add an entry
 // to SECTIONS, a description, and render its content in <SectionContent />.
 
-type SectionId = "appearance" | "terminal" | "transfers" | "editors" | "about";
+type SectionId = "appearance" | "terminal" | "transfers" | "editors" | "data" | "about";
 
 const SECTIONS: { id: SectionId; label: string; icon: LucideIcon }[] = [
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "terminal", label: "Terminal", icon: SquareTerminal },
   { id: "transfers", label: "Transfers", icon: ArrowUpDown },
   { id: "editors", label: "Editors", icon: FileCode },
+  { id: "data", label: "Data", icon: Database },
   { id: "about", label: "About & Updates", icon: Info },
 ];
 
@@ -60,6 +61,7 @@ const SECTION_DESCRIPTIONS: Record<SectionId, string> = {
   terminal: "Font, cursor, and scrollback history.",
   transfers: "Control how files are transferred.",
   editors: "Editors used by “Edit” / “Open With” in the file browser.",
+  data: "Back up, restore, and reset your data.",
   about: "App information, links, and updates.",
 };
 
@@ -148,6 +150,8 @@ function SectionContent({ section }: { section: SectionId }) {
       return <TransferSettings />;
     case "editors":
       return <EditorsSettings />;
+    case "data":
+      return <DataSettings />;
     case "about":
       return <AboutSettings />;
   }
@@ -606,6 +610,434 @@ function TransferSettings() {
         <NumberSetting id="s-concurrency" value={transferConcurrency} min={1} max={10} step={1} onChange={setConcurrency} />
       </SettingRow>
     </SettingsGroup>
+  );
+}
+
+// ─── Data ───────────────────────────────────────────────────────────────────────
+
+function DataSettings() {
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  // Import is two-step: pick a file, then prompt for its password.
+  const [importPath, setImportPath] = useState<string | null>(null);
+
+  const pickImportFile = useCallback(async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const picked = await open({
+        multiple: false,
+        directory: false,
+        title: "Select anySCP backup",
+        filters: [{ name: "anySCP backup", extensions: ["ascpbak"] }],
+      });
+      if (typeof picked === "string") setImportPath(picked);
+    } catch { /* dialog cancelled / unavailable */ }
+  }, []);
+
+  return (
+    <>
+      <SettingsGroup label="Backup">
+        <SettingRow>
+          <div>
+            <p className={LABEL_CLASS}>Export encrypted backup</p>
+            <p className={DESC_CLASS}>
+              Save all hosts, groups, snippets, settings, and stored credentials to a
+              single password-protected file.
+            </p>
+          </div>
+          <button type="button" data-testid="s-export-backup" onClick={() => setExportOpen(true)} className={BTN_SECONDARY}>
+            <Download size={13} strokeWidth={2} /> Export…
+          </button>
+        </SettingRow>
+        <SettingRow>
+          <div>
+            <p className={LABEL_CLASS}>Import backup</p>
+            <p className={DESC_CLASS}>
+              Restore from a backup file. This replaces all current data and restarts anySCP.
+            </p>
+          </div>
+          <button type="button" data-testid="s-import-backup" onClick={() => void pickImportFile()} className={BTN_SECONDARY}>
+            <Upload size={13} strokeWidth={2} /> Import…
+          </button>
+        </SettingRow>
+      </SettingsGroup>
+
+      <SettingsGroup label="Danger zone">
+        <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-xl bg-bg-surface border border-status-error/30">
+          <div>
+            <p className={LABEL_CLASS}>Clear all data</p>
+            <p className={DESC_CLASS}>
+              Permanently delete every saved host, group, connection history entry,
+              snippet, port-forward rule, and S3 connection — along with their stored
+              credentials and all app preferences. anySCP restarts at first-launch state.
+              This can’t be undone.
+            </p>
+          </div>
+          <button
+            type="button"
+            data-testid="s-clear-data"
+            onClick={() => setConfirmOpen(true)}
+            className={[
+              "flex items-center gap-1.5 px-3 py-1.5 rounded-lg shrink-0",
+              "text-[length:var(--text-sm)] font-medium",
+              "bg-status-error/10 border border-status-error/40 text-status-error",
+              "hover:bg-status-error/15",
+              "transition-colors duration-[var(--duration-fast)]",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            ].join(" ")}
+          >
+            <Trash2 size={13} strokeWidth={2} /> Clear all data…
+          </button>
+        </div>
+      </SettingsGroup>
+
+      <BackupPasswordModal mode="export" open={exportOpen} onClose={() => setExportOpen(false)} />
+      <BackupPasswordModal
+        mode="import"
+        open={importPath !== null}
+        path={importPath ?? undefined}
+        onClose={() => setImportPath(null)}
+      />
+      <ConfirmResetModal open={confirmOpen} onClose={() => setConfirmOpen(false)} />
+    </>
+  );
+}
+
+/** Passphrase dialog for encrypted backup export/import.
+ *  - export: set + confirm a password, then a save-file dialog picks the path.
+ *  - import: enter the file's password; on success the app relaunches so the
+ *    restored data loads cleanly. */
+function BackupPasswordModal({ mode, open, path, onClose }: {
+  mode: "export" | "import";
+  open: boolean;
+  path?: string;
+  onClose: () => void;
+}) {
+  const isExport = mode === "export";
+  const MIN_LEN = 8;
+  const [pw, setPw] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [visible, setVisible] = useState(false);
+
+  const backdropRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const valid = isExport ? pw.length >= MIN_LEN && pw === confirm : pw.length > 0;
+  const canSubmit = valid && !busy;
+
+  useEffect(() => {
+    if (open) {
+      setPw("");
+      setConfirm("");
+      setBusy(false);
+      requestAnimationFrame(() => setVisible(true));
+    } else {
+      setVisible(false);
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (visible) requestAnimationFrame(() => inputRef.current?.focus());
+  }, [visible]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape" && !busy) onClose(); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose, busy]);
+
+  const submit = useCallback(async () => {
+    if (!canSubmit) return;
+    setBusy(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      if (isExport) {
+        const { save } = await import("@tauri-apps/plugin-dialog");
+        const d = new Date();
+        const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+        const dest = await save({
+          title: "Save anySCP backup",
+          defaultPath: `anyscp-backup-${stamp}.ascpbak`,
+          filters: [{ name: "anySCP backup", extensions: ["ascpbak"] }],
+        });
+        if (!dest) { setBusy(false); return; } // dialog cancelled — keep the modal open
+        await invoke("backup_export", { password: pw, path: dest });
+        toast.success("Encrypted backup saved.");
+        onClose();
+      } else {
+        await invoke("backup_import", { password: pw, path });
+        // Relaunch so all in-memory state reloads from the restored database.
+        try {
+          const { relaunch } = await import("@tauri-apps/plugin-process");
+          await relaunch();
+        } catch {
+          window.location.reload();
+        }
+      }
+    } catch (e: unknown) {
+      setBusy(false);
+      const msg = e && typeof e === "object" && "message" in e
+        ? String((e as { message: unknown }).message)
+        : null;
+      toast.error(msg ?? (isExport ? "Couldn’t export backup." : "Import failed."));
+    }
+  }, [canSubmit, isExport, pw, path, onClose]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      ref={backdropRef}
+      onClick={(e) => { if (e.target === backdropRef.current && !busy) onClose(); }}
+      className={[
+        "fixed inset-0 z-50 flex items-start justify-center pt-[10vh]",
+        "transition-[background-color,backdrop-filter] duration-[var(--duration-base)]",
+        visible ? "bg-black/50 backdrop-blur-sm" : "bg-black/0 backdrop-blur-none",
+      ].join(" ")}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="backup-title"
+        data-testid={`backup-modal-${mode}`}
+        className={[
+          "w-full max-w-md rounded-xl bg-bg-overlay border border-border shadow-[var(--shadow-lg)]",
+          "flex flex-col",
+          "transition-[opacity,transform] duration-[var(--duration-slow)] ease-[var(--ease-expo-out)]",
+          visible ? "opacity-100 translate-y-0" : "opacity-0 -translate-y-3",
+        ].join(" ")}
+      >
+        {/* Header */}
+        <div className="flex items-center gap-2.5 px-6 pt-5 pb-4 border-b border-border shrink-0">
+          {isExport
+            ? <ShieldCheck size={18} strokeWidth={2} className="text-accent shrink-0" />
+            : <AlertCircle size={18} strokeWidth={2} className="text-status-error shrink-0" />}
+          <h2 id="backup-title" className="text-[length:var(--text-lg)] font-semibold text-text-primary">
+            {isExport ? "Export encrypted backup" : "Import backup"}
+          </h2>
+        </div>
+
+        {/* Body */}
+        <form
+          onSubmit={(e) => { e.preventDefault(); void submit(); }}
+          className="px-6 py-4 flex flex-col gap-4"
+        >
+          <p className="text-[length:var(--text-sm)] text-text-secondary">
+            {isExport
+              ? "Choose a password to encrypt the backup. You’ll need it to restore — there’s no way to recover the data without it."
+              : "Enter the password this backup was created with. Importing replaces all current data and restarts anySCP."}
+          </p>
+
+          <div>
+            <label htmlFor="backup-pw" className={FIELD_LABEL_CLASS}>Password</label>
+            <input
+              ref={inputRef}
+              id="backup-pw"
+              data-testid="backup-password"
+              type="password"
+              autoComplete={isExport ? "new-password" : "current-password"}
+              value={pw}
+              disabled={busy}
+              onChange={(e) => setPw(e.target.value)}
+              placeholder={isExport ? `At least ${MIN_LEN} characters` : "Backup password"}
+              className={TEXT_INPUT_CLASS}
+            />
+          </div>
+
+          {isExport && (
+            <div>
+              <label htmlFor="backup-pw2" className={FIELD_LABEL_CLASS}>Confirm password</label>
+              <input
+                id="backup-pw2"
+                data-testid="backup-password-confirm"
+                type="password"
+                autoComplete="new-password"
+                value={confirm}
+                disabled={busy}
+                onChange={(e) => setConfirm(e.target.value)}
+                placeholder="Re-enter password"
+                className={TEXT_INPUT_CLASS}
+              />
+              {confirm.length > 0 && pw !== confirm && (
+                <p className="mt-1 text-[length:var(--text-xs)] text-status-error">Passwords don’t match.</p>
+              )}
+            </div>
+          )}
+
+          {/* Footer */}
+          <div className="flex items-center justify-end gap-2 pt-1">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={busy}
+              className="px-4 py-2 text-[length:var(--text-sm)] text-text-secondary hover:text-text-primary rounded-lg transition-colors duration-[var(--duration-fast)] disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              data-testid="backup-submit"
+              disabled={!canSubmit}
+              className={[
+                "flex items-center gap-1.5 px-4 py-2 rounded-lg",
+                "text-[length:var(--text-sm)] font-medium text-text-inverse",
+                isExport ? "bg-accent hover:bg-accent-hover" : "bg-status-error hover:opacity-90",
+                "disabled:opacity-50 disabled:cursor-not-allowed",
+                "transition-[opacity,background-color] duration-[var(--duration-fast)]",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg-overlay",
+              ].join(" ")}
+            >
+              {busy && <RefreshCw size={13} strokeWidth={2} className="motion-safe:animate-spin" />}
+              {isExport
+                ? (busy ? "Exporting…" : "Choose file & export")
+                : (busy ? "Restoring…" : "Import & restart")}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+/** Typed-confirmation dialog for the irreversible factory reset. The user must
+ *  type the confirm word, then we wipe the backend and relaunch the app. */
+function ConfirmResetModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const CONFIRM_WORD = "DELETE";
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [visible, setVisible] = useState(false);
+
+  const backdropRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const canReset = text.trim() === CONFIRM_WORD && !busy;
+
+  useEffect(() => {
+    if (open) {
+      setText("");
+      setBusy(false);
+      requestAnimationFrame(() => setVisible(true));
+    } else {
+      setVisible(false);
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (visible) requestAnimationFrame(() => inputRef.current?.focus());
+  }, [visible]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape" && !busy) onClose(); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose, busy]);
+
+  const doReset = useCallback(async () => {
+    setBusy(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("factory_reset");
+      // Relaunch so all in-memory state — frontend stores AND backend sessions —
+      // restarts from the now-empty database, a true first-launch state.
+      try {
+        const { relaunch } = await import("@tauri-apps/plugin-process");
+        await relaunch();
+      } catch {
+        // Relaunch unavailable (dev/web) — reload the webview as a fallback.
+        window.location.reload();
+      }
+    } catch {
+      setBusy(false);
+      toast.error("Couldn’t clear data. Please try again.");
+    }
+  }, []);
+
+  if (!open) return null;
+
+  return (
+    <div
+      ref={backdropRef}
+      onClick={(e) => { if (e.target === backdropRef.current && !busy) onClose(); }}
+      className={[
+        "fixed inset-0 z-50 flex items-start justify-center pt-[12vh]",
+        "transition-[background-color,backdrop-filter] duration-[var(--duration-base)]",
+        visible ? "bg-black/50 backdrop-blur-sm" : "bg-black/0 backdrop-blur-none",
+      ].join(" ")}
+    >
+      <div
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="reset-title"
+        data-testid="reset-modal"
+        className={[
+          "w-full max-w-md rounded-xl bg-bg-overlay border border-border shadow-[var(--shadow-lg)]",
+          "flex flex-col",
+          "transition-[opacity,transform] duration-[var(--duration-slow)] ease-[var(--ease-expo-out)]",
+          visible ? "opacity-100 translate-y-0" : "opacity-0 -translate-y-3",
+        ].join(" ")}
+      >
+        {/* Header */}
+        <div className="flex items-center gap-2.5 px-6 pt-5 pb-4 border-b border-border shrink-0">
+          <AlertCircle size={18} strokeWidth={2} className="text-status-error shrink-0" />
+          <h2 id="reset-title" className="text-[length:var(--text-lg)] font-semibold text-text-primary">
+            Clear all data?
+          </h2>
+        </div>
+
+        {/* Body */}
+        <div className="px-6 py-4 flex flex-col gap-4">
+          <p className="text-[length:var(--text-sm)] text-text-secondary">
+            This permanently deletes <strong className="text-text-primary">all</strong> saved
+            hosts, groups, history, snippets, port-forward rules, S3 connections, stored
+            credentials, and preferences. anySCP will restart fresh. This action cannot be undone.
+          </p>
+          <div>
+            <label htmlFor="reset-confirm" className={FIELD_LABEL_CLASS}>
+              Type <code className="px-1 rounded bg-bg-base text-status-error">{CONFIRM_WORD}</code> to confirm
+            </label>
+            <input
+              ref={inputRef}
+              id="reset-confirm"
+              data-testid="reset-confirm-input"
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              value={text}
+              disabled={busy}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && canReset) void doReset(); }}
+              placeholder={CONFIRM_WORD}
+              className={TEXT_INPUT_CLASS}
+            />
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="px-6 pb-5 pt-3 flex items-center justify-end gap-2 border-t border-border shrink-0">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="px-4 py-2 text-[length:var(--text-sm)] text-text-secondary hover:text-text-primary rounded-lg transition-colors duration-[var(--duration-fast)] disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            data-testid="reset-confirm-submit"
+            onClick={() => void doReset()}
+            disabled={!canReset}
+            className="flex items-center gap-1.5 px-4 py-2 text-[length:var(--text-sm)] font-medium text-text-inverse bg-status-error hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition-[opacity] duration-[var(--duration-fast)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg-overlay"
+          >
+            {busy && <RefreshCw size={13} strokeWidth={2} className="motion-safe:animate-spin" />}
+            {busy ? "Clearing…" : "Clear all data"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

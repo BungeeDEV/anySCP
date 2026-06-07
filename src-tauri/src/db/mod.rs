@@ -1608,6 +1608,248 @@ impl HostDb {
         }
         Ok(result)
     }
+
+    // -----------------------------------------------------------------------
+    // Factory reset
+    // -----------------------------------------------------------------------
+
+    /// Wipe ALL user data for a factory reset: every data table plus app
+    /// settings. The schema (`_meta`/`schema_version`) and table structures are
+    /// kept intact, so the database ends up identical to a fresh install — the
+    /// next launch re-seeds first-run defaults (e.g. `editors_seeded`).
+    ///
+    /// Returns the host ids and S3 connection ids whose rows were removed so the
+    /// caller can purge their secrets from the OS keychain — the `keyring` crate
+    /// can't enumerate entries, so they must be deleted by key (see
+    /// [`ResetKeys`]).
+    #[instrument(skip(self))]
+    pub fn factory_reset(&self) -> Result<ResetKeys, DbError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| DbError::InitError(format!("db lock poisoned: {e}")))?;
+
+        // Collect the keychain keys before deleting the rows that reference them.
+        let host_ids = conn
+            .prepare("SELECT id FROM saved_hosts")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        let s3_ids = conn
+            .prepare("SELECT id FROM s3_connections")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+
+        // One transaction. `defer_foreign_keys` postpones FK checks to commit, so
+        // we don't have to order deletes around the self-referential
+        // `saved_hosts.proxy_jump_host_id` or the cross-table FKs. Deleting from
+        // `snippets` fires the FTS triggers that keep `snippets_fts` consistent.
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "PRAGMA defer_foreign_keys = TRUE;
+             DELETE FROM connection_history;
+             DELETE FROM port_forwarding_rules;
+             DELETE FROM s3_connections;
+             DELETE FROM snippets;
+             DELETE FROM snippet_folders;
+             DELETE FROM saved_hosts;
+             DELETE FROM host_groups;
+             DELETE FROM app_settings;",
+        )?;
+        tx.commit()?;
+
+        tracing::info!(
+            hosts = host_ids.len(),
+            s3 = s3_ids.len(),
+            "factory reset: cleared all data and settings"
+        );
+        Ok(ResetKeys { host_ids, s3_ids })
+    }
+
+    // -----------------------------------------------------------------------
+    // Backup snapshot (raw SQLite, full fidelity)
+    // -----------------------------------------------------------------------
+
+    /// Produce a consistent single-file SQLite snapshot of the entire database
+    /// (every table, current schema) as raw bytes. `VACUUM INTO` is safe on a
+    /// live WAL connection and yields a clean copy with no `-wal`/`-shm`
+    /// sidecars. Used by the encrypted backup export.
+    #[instrument(skip(self))]
+    pub fn export_db_snapshot(&self) -> Result<Vec<u8>, DbError> {
+        // The snapshot is plaintext on disk until the caller encrypts it, so it
+        // lives inside an owner-only (0700) temp dir and is removed on every
+        // path, including read failures.
+        let dir = private_temp_dir("anyscp-export")?;
+        let tmp = dir.join("snapshot.db");
+        let result = (|| -> Result<Vec<u8>, DbError> {
+            {
+                let conn = self
+                    .conn
+                    .lock()
+                    .map_err(|e| DbError::InitError(format!("db lock poisoned: {e}")))?;
+                // VACUUM INTO doesn't accept bound parameters; the path is our own
+                // uuid temp path, single-quote-escaped defensively.
+                let escaped = tmp.to_string_lossy().replace('\'', "''");
+                conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
+            }
+            std::fs::read(&tmp).map_err(|e| DbError::InitError(format!("read snapshot: {e}")))
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    /// Replace ALL data with the contents of a raw SQLite snapshot (as produced
+    /// by [`export_db_snapshot`]). The incoming snapshot is migrated up to the
+    /// current schema first, so older backups restore cleanly; a snapshot from
+    /// a newer app version is rejected. The copy runs in one transaction with
+    /// deferred FK checks; the snippets FTS index is rebuilt by the table
+    /// triggers as rows are inserted.
+    #[instrument(skip(self, bytes))]
+    pub fn import_db_snapshot(&self, bytes: &[u8]) -> Result<(), DbError> {
+        // The app's current schema version (main was migrated on startup).
+        let current: i64 = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| DbError::InitError(format!("db lock poisoned: {e}")))?;
+            conn.query_row(
+                "SELECT CAST(value AS INTEGER) FROM _meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+        };
+
+        // Owner-only temp dir for the (plaintext) snapshot during restore.
+        let tmp_dir = private_temp_dir("anyscp-restore")?;
+        let tmp_db = tmp_dir.join("anyscp.db");
+
+        let result = (|| -> Result<(), DbError> {
+            std::fs::write(&tmp_db, bytes)
+                .map_err(|e| DbError::InitError(format!("write snapshot: {e}")))?;
+
+            // Validate the snapshot and migrate it up to the current schema.
+            {
+                let bak = Connection::open(&tmp_db)?;
+                let bak_ver: i64 = bak
+                    .query_row(
+                        "SELECT CAST(value AS INTEGER) FROM _meta WHERE key = 'schema_version'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|_| {
+                        DbError::Validation(
+                            "this file is not a valid anySCP backup (no schema marker)".into(),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        DbError::Validation(
+                            "this file is not a valid anySCP backup (no schema marker)".into(),
+                        )
+                    })?;
+                if bak_ver > current {
+                    return Err(DbError::Validation(format!(
+                        "backup is from a newer version of anySCP (schema {bak_ver} > {current}); update anySCP first"
+                    )));
+                }
+                bak.execute_batch("PRAGMA foreign_keys = ON;")?;
+                Self::run_migrations(&bak)?;
+                bak.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            } // bak connection dropped (and checkpointed) here
+
+            // Copy every table into the live database, replacing current data.
+            let mut conn = self
+                .conn
+                .lock()
+                .map_err(|e| DbError::InitError(format!("db lock poisoned: {e}")))?;
+            conn.execute(
+                "ATTACH DATABASE ?1 AS bak",
+                params![tmp_db.to_string_lossy()],
+            )?;
+            let copy = (|| -> Result<(), DbError> {
+                let tx = conn.transaction()?;
+                tx.execute_batch("PRAGMA defer_foreign_keys = TRUE;")?;
+                // Replace every table. Deferred FK checks mean delete/insert
+                // order doesn't matter; the snippets FTS index is maintained by
+                // its triggers as rows are inserted.
+                //
+                // Columns are listed explicitly, by NAME, read from the live
+                // schema — `INSERT ... SELECT *` would map by position and could
+                // silently mis-map if a future migration ever reordered columns.
+                for table in COPYABLE_TABLES {
+                    tx.execute(&format!("DELETE FROM main.{table}"), [])?;
+                }
+                for table in COPYABLE_TABLES {
+                    let cols = table_columns(&tx, table)?;
+                    if cols.is_empty() {
+                        continue;
+                    }
+                    let list = cols.join(", ");
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO main.{table} ({list}) SELECT {list} FROM bak.{table}"
+                        ),
+                        [],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })();
+            // Always detach, even if the copy failed.
+            let _ = conn.execute("DETACH DATABASE bak", []);
+            copy
+        })();
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        result
+    }
+}
+
+/// Keychain keys whose secrets must be purged after a [`HostDb::factory_reset`].
+/// Host credentials are keyed by `host_id`; S3 credentials by `s3:{id}`.
+#[derive(Debug, Default)]
+pub struct ResetKeys {
+    pub host_ids: Vec<String>,
+    pub s3_ids: Vec<String>,
+}
+
+/// Tables copied wholesale during a snapshot restore. `_meta` (schema marker)
+/// is intentionally kept, and `snippets_fts*` shadow tables are excluded — they
+/// are rebuilt by the snippets triggers as rows are inserted.
+const COPYABLE_TABLES: &[&str] = &[
+    "host_groups",
+    "saved_hosts",
+    "connection_history",
+    "snippet_folders",
+    "snippets",
+    "port_forwarding_rules",
+    "s3_connections",
+    "app_settings",
+];
+
+/// Column names of `table` in declaration order, read from the live schema.
+/// `table` is always a trusted constant from [`COPYABLE_TABLES`].
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(cols)
+}
+
+/// Create an owner-only (0700 on Unix) temp directory for a short-lived,
+/// *plaintext* SQLite snapshot. The caller removes it when done.
+fn private_temp_dir(prefix: &str) -> Result<std::path::PathBuf, DbError> {
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(|e| DbError::InitError(format!("temp dir: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| DbError::InitError(format!("temp dir perms: {e}")))?;
+    }
+    Ok(dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -1678,6 +1920,109 @@ mod tests {
         assert_eq!(all[0].id, "host-1");
         assert_eq!(all[0].port, 22);
         assert!(all[0].group_id.is_none());
+    }
+
+    #[test]
+    fn factory_reset_wipes_everything_and_returns_keys() {
+        let (db, _dir) = test_db();
+        db.create_group(&sample_group("grp-1"))
+            .expect("create_group");
+        let mut h = sample_host("host-1");
+        h.group_id = Some("grp-1".to_string());
+        db.save_host(&h).expect("save_host");
+        db.record_connection("host-1").expect("record_connection");
+        db.save_setting("app_theme", "light").expect("save_setting");
+
+        let keys = db.factory_reset().expect("factory_reset");
+        assert_eq!(keys.host_ids, vec!["host-1".to_string()]);
+        assert!(keys.s3_ids.is_empty());
+
+        // Every data table and app settings are now empty.
+        assert!(db.list_hosts().expect("list_hosts").is_empty());
+        assert!(db.list_groups().expect("list_groups").is_empty());
+        assert!(db.list_recent_connections(50).expect("recent").is_empty());
+        assert!(db.load_all_settings().expect("settings").is_empty());
+
+        // The schema survives the wipe — a fresh insert still works (i.e. the
+        // DB is reset to first-launch state, not corrupted/dropped).
+        db.save_host(&sample_host("host-2"))
+            .expect("save after reset");
+        assert_eq!(db.list_hosts().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn db_snapshot_export_import_roundtrip() {
+        // Seed a source DB with a group + host (FK) + a setting, snapshot it.
+        let (src, _d1) = test_db();
+        src.create_group(&sample_group("g1")).expect("create_group");
+        let mut h = sample_host("h1");
+        h.group_id = Some("g1".to_string());
+        src.save_host(&h).expect("save_host");
+        src.save_setting("app_theme", "light")
+            .expect("save_setting");
+        src.save_snippet_folder(&sample_snippet_folder("sf1"))
+            .expect("save_snippet_folder");
+        src.save_snippet(&sample_snippet("s1"))
+            .expect("save_snippet");
+        let snapshot = src.export_db_snapshot().expect("export_db_snapshot");
+
+        // Import into a separate, initially-empty DB.
+        let (dst, _d2) = test_db();
+        assert!(dst.list_hosts().expect("list").is_empty());
+        dst.import_db_snapshot(&snapshot)
+            .expect("import_db_snapshot");
+
+        let hosts = dst.list_hosts().expect("list_hosts");
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].id, "h1");
+        assert_eq!(hosts[0].group_id.as_deref(), Some("g1"));
+        assert_eq!(dst.list_groups().expect("list_groups").len(), 1);
+        assert!(dst
+            .load_all_settings()
+            .expect("settings")
+            .iter()
+            .any(|(k, v)| k == "app_theme" && v == "light"));
+        // Snippets copy over, and the FTS index is rebuilt by the table triggers
+        // during the ATTACH copy (search must find the snippet afterwards).
+        assert_eq!(dst.list_snippets(None).expect("list_snippets").len(), 1);
+        assert_eq!(dst.list_snippet_folders().expect("folders").len(), 1);
+        assert!(
+            !dst.search_snippets("shell", 10).expect("search").is_empty(),
+            "FTS index should be populated after import"
+        );
+    }
+
+    #[test]
+    fn db_snapshot_import_replaces_existing() {
+        let (src, _d1) = test_db();
+        src.save_host(&sample_host("from-backup")).expect("save");
+        let snapshot = src.export_db_snapshot().expect("export");
+
+        // Destination already has unrelated data; import must replace it.
+        let (dst, _d2) = test_db();
+        dst.save_host(&sample_host("pre-existing")).expect("save");
+        dst.import_db_snapshot(&snapshot).expect("import");
+
+        let ids: Vec<String> = dst
+            .list_hosts()
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(ids, vec!["from-backup".to_string()]);
+    }
+
+    #[test]
+    fn db_snapshot_import_rejects_non_backup() {
+        let (dst, _d) = test_db();
+        let err = dst
+            .import_db_snapshot(b"this is not a sqlite database")
+            .expect_err("must reject");
+        // Either a validation message or a sqlite "not a database" error; both
+        // mean the import refused garbage rather than corrupting the live DB.
+        assert!(matches!(err, DbError::Validation(_) | DbError::Sqlite(_)));
+        // Live DB is untouched / usable.
+        assert!(dst.list_hosts().expect("list").is_empty());
     }
 
     #[test]
