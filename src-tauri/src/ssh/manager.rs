@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use super::handler::SshClientHandler;
@@ -40,6 +41,11 @@ pub struct SshManager {
     sessions: DashMap<String, SshSession>,
     /// Bare SSH handles for SFTP-only connections (no PTY).
     bare_handles: DashMap<String, BareConn>,
+    /// In-flight connection attempts, keyed by the frontend-supplied attempt ID.
+    /// A handle exists here only while a `connect`/`connect_no_pty` call is
+    /// running; cancelling its token aborts the attempt before any session is
+    /// registered, so no ghost session or lingering handle is left behind.
+    pending_connects: DashMap<String, CancellationToken>,
 }
 
 impl SshManager {
@@ -47,6 +53,34 @@ impl SshManager {
         Self {
             sessions: DashMap::new(),
             bare_handles: DashMap::new(),
+            pending_connects: DashMap::new(),
+        }
+    }
+
+    /// Register a cancellation token for an in-flight connection attempt and
+    /// return a clone the connect path can await on. Re-registering the same
+    /// attempt ID replaces (and orphans) the previous token.
+    fn register_pending(&self, attempt_id: String) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.pending_connects.insert(attempt_id, token.clone());
+        token
+    }
+
+    /// Drop the pending registration for `attempt_id` once the attempt settles
+    /// (succeeded, failed, or was cancelled).
+    fn clear_pending(&self, attempt_id: &str) {
+        self.pending_connects.remove(attempt_id);
+    }
+
+    /// Abort an in-flight connection attempt by its attempt ID. Returns `true`
+    /// if a matching attempt was found and signalled. The connect path observes
+    /// the cancellation, unwinds its partial state, and removes the registration.
+    pub fn cancel_connect(&self, attempt_id: &str) -> bool {
+        if let Some(entry) = self.pending_connects.get(attempt_id) {
+            entry.cancel();
+            true
+        } else {
+            false
         }
     }
 
@@ -55,9 +89,16 @@ impl SshManager {
         &self,
         config: HostConfig,
         app_handle: AppHandle,
+        attempt_id: Option<String>,
     ) -> Result<SessionId, SshError> {
         let session_id = SessionId::new();
         let sid = session_id.0.clone();
+
+        // Arm cancellation for this attempt (if the frontend supplied an ID) so
+        // `cancel_connect` can abort it mid-handshake.
+        let cancel_token = attempt_id
+            .as_ref()
+            .map(|id| self.register_pending(id.clone()));
 
         let _ = app_handle.emit(
             "ssh:status",
@@ -88,22 +129,44 @@ impl SshManager {
         // chain. The jump handles must outlive the target session, so they are
         // handed (shared) to the SshSession to keep alive; sharing via Arc lets
         // split panes on the same connection hold the tunnel open too.
-        let (handle, jump_handles) = Self::establish(&config, russh_config).await?;
+        //
+        // The whole establish + PTY-open is raced against the cancellation token:
+        // if the user cancels, the future is dropped mid-await, which drops any
+        // partially-established handles and lets russh tear the connection down.
+        // Nothing is inserted into `sessions` until this succeeds, so a cancel
+        // leaves no ghost session behind.
+        let connect_fut = async {
+            let (handle, jump_handles) = Self::establish(&config, russh_config).await?;
 
-        info!(session_id = %sid, host = %config.host, "SSH authenticated");
+            info!(session_id = %sid, host = %config.host, "SSH authenticated");
 
-        let session = SshSession::open_pty(
-            handle,
-            Arc::new(jump_handles),
-            sid.clone(),
-            80,
-            24,
-            app_handle,
-            config.default_shell.clone(),
-            config.startup_command.clone(),
-        )
-        .await?;
+            SshSession::open_pty(
+                handle,
+                Arc::new(jump_handles),
+                sid.clone(),
+                80,
+                24,
+                app_handle,
+                config.default_shell.clone(),
+                config.startup_command.clone(),
+            )
+            .await
+        };
 
+        let outcome = match &cancel_token {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => Err(SshError::Cancelled),
+                r = connect_fut => r,
+            },
+            None => connect_fut.await,
+        };
+
+        if let Some(id) = &attempt_id {
+            self.clear_pending(id);
+        }
+
+        let session = outcome?;
         self.sessions.insert(sid.clone(), session);
 
         Ok(session_id)
@@ -112,17 +175,40 @@ impl SshManager {
     /// Establish an SSH connection without opening a PTY.
     /// Used for SFTP-only sessions where no terminal is needed.
     /// Returns a session ID that can be used with `get_handle`.
-    pub async fn connect_no_pty(&self, config: HostConfig) -> Result<SessionId, SshError> {
+    pub async fn connect_no_pty(
+        &self,
+        config: HostConfig,
+        attempt_id: Option<String>,
+    ) -> Result<SessionId, SshError> {
         let session_id = SessionId::new();
         let sid = session_id.0.clone();
+
+        let cancel_token = attempt_id
+            .as_ref()
+            .map(|id| self.register_pending(id.clone()));
 
         let russh_config = Arc::new(client::Config {
             inactivity_timeout: None, // SFTP connections stay alive indefinitely
             ..Default::default()
         });
 
-        // Establish the connection — directly or tunnelled through a ProxyJump.
-        let (handle, jump_handles) = Self::establish(&config, russh_config).await?;
+        // Establish the connection — directly or tunnelled through a ProxyJump —
+        // racing against the cancellation token so the user can abort mid-handshake.
+        let establish_fut = Self::establish(&config, russh_config);
+        let established = match &cancel_token {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => Err(SshError::Cancelled),
+                r = establish_fut => r,
+            },
+            None => establish_fut.await,
+        };
+
+        if let Some(id) = &attempt_id {
+            self.clear_pending(id);
+        }
+
+        let (handle, jump_handles) = established?;
 
         info!(session_id = %sid, host = %config.host, "SSH authenticated (no PTY, for SFTP)");
 

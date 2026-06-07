@@ -33,10 +33,23 @@ const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 #[tauri::command]
 pub async fn ssh_connect(
     host_config: HostConfig,
+    attempt_id: Option<String>,
     state: State<'_, SshManager>,
     app_handle: AppHandle,
 ) -> Result<SessionId, SshError> {
-    state.connect(host_config, app_handle).await
+    state.connect(host_config, app_handle, attempt_id).await
+}
+
+/// Abort an in-flight connection attempt identified by the frontend-supplied
+/// `attempt_id`. The pending `connect`/`connect_no_pty` call unwinds its partial
+/// state and returns `SshError::Cancelled`. A no-op if the attempt already
+/// settled (returns `false`).
+#[tauri::command]
+pub async fn ssh_cancel_connect(
+    attempt_id: String,
+    state: State<'_, SshManager>,
+) -> Result<bool, SshError> {
+    Ok(state.cancel_connect(&attempt_id))
 }
 
 #[tauri::command]
@@ -522,6 +535,7 @@ mod tests {
 #[tauri::command]
 pub async fn connect_saved_host(
     host_id: String,
+    attempt_id: Option<String>,
     state: State<'_, SshManager>,
     db: State<'_, Arc<HostDb>>,
     app_handle: AppHandle,
@@ -539,7 +553,7 @@ pub async fn connect_saved_host(
     .map_err(|e| SshError::IoError(format!("task panicked: {e}")))??;
 
     let auth_type = auth_method_label(&config.auth_method).to_string();
-    let session_id = state.connect(config, app_handle).await?;
+    let session_id = state.connect(config, app_handle, attempt_id).await?;
 
     crate::telemetry::capture(
         "ssh_connected",
@@ -651,6 +665,7 @@ fn build_host_config_blocking(
 #[tauri::command]
 pub async fn connect_saved_host_no_pty(
     host_id: String,
+    attempt_id: Option<String>,
     state: State<'_, SshManager>,
     db: State<'_, Arc<HostDb>>,
 ) -> Result<SessionId, SshError> {
@@ -662,5 +677,5 @@ pub async fn connect_saved_host_no_pty(
     .await
     .map_err(|e| SshError::IoError(format!("task panicked: {e}")))??;
 
-    state.connect_no_pty(config).await
+    state.connect_no_pty(config, attempt_id).await
 }

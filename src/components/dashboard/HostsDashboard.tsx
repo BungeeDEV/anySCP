@@ -24,6 +24,18 @@ import { GroupModal } from "./GroupModal";
 import { ConnectionDialog } from "./ConnectionDialog";
 import { RecentConnections } from "./RecentConnections";
 
+// Abort an in-flight SSH connection attempt on the Rust side. Best-effort:
+// the attempt may already have settled, in which case the backend reports it
+// found nothing and we simply move on.
+async function cancelConnectAttempt(attemptId: string) {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("ssh_cancel_connect", { attemptId });
+  } catch {
+    /* attempt already finished — nothing to cancel */
+  }
+}
+
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export function HostsDashboard() {
@@ -83,10 +95,16 @@ export function HostsDashboard() {
   };
 
   const handleS3Connect = async (conn: S3Connection) => {
-    setConnectingHost({ label: conn.label, error: null, retry: () => void handleS3Connect(conn) });
+    let cancelled = false;
+    const cancel = () => {
+      cancelled = true;
+      setConnectingHost(null);
+    };
+    setConnectingHost({ label: conn.label, error: null, retry: () => void handleS3Connect(conn), cancel });
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       await invoke("s3_reconnect", { id: conn.id });
+      if (cancelled) return;
       useS3Store.getState().openSession(conn.id, conn.label);
       if (conn.bucket) {
         useS3Store.getState().setCurrentBucket(conn.id, conn.bucket);
@@ -94,10 +112,11 @@ export function HostsDashboard() {
       setConnectingHost(null);
       useTabStore.getState().addTab({ type: "s3", id: conn.id, label: conn.label });
     } catch (err) {
+      if (cancelled) return;
       const msg = err && typeof err === "object" && "message" in err
         ? String((err as { message: string }).message)
         : "S3 connection failed";
-      setConnectingHost({ label: conn.label, error: msg, retry: () => void handleS3Connect(conn) });
+      setConnectingHost({ label: conn.label, error: msg, retry: () => void handleS3Connect(conn), cancel: null });
     }
   };
 
@@ -110,7 +129,7 @@ export function HostsDashboard() {
   };
 
   // Connection dialog state
-  const [connectingHost, setConnectingHost] = useState<{ label: string; error: string | null; retry: (() => void) | null } | null>(null);
+  const [connectingHost, setConnectingHost] = useState<{ label: string; error: string | null; retry: (() => void) | null; cancel: (() => void) | null } | null>(null);
 
   // Load data on mount
   useEffect(() => {
@@ -203,11 +222,22 @@ export function HostsDashboard() {
   const connectToHost = useCallback(
     async (host: SavedHost) => {
       const label = host.label || `${host.username}@${host.host}`;
-      setConnectingHost({ label, error: null, retry: () => void connectToHost(host) });
+      const attemptId = crypto.randomUUID();
+      let cancelled = false;
+      const cancel = () => {
+        cancelled = true;
+        void cancelConnectAttempt(attemptId);
+        setConnectingHost(null);
+      };
+      setConnectingHost({ label, error: null, retry: () => void connectToHost(host), cancel });
       try {
         const { invoke } = await import("@tauri-apps/api/core");
         const addSession = useSessionStore.getState().addSession;
-        const sessionId = await invoke<string>("connect_saved_host", { hostId: host.id });
+        const sessionId = await invoke<string>("connect_saved_host", { hostId: host.id, attemptId });
+        if (cancelled) {
+          void invoke("ssh_disconnect", { sessionId });
+          return;
+        }
         const hostLabel = host.label || `${host.username}@${host.host}`;
         addSession(sessionId, {
           host: host.host,
@@ -220,10 +250,11 @@ export function HostsDashboard() {
         setConnectingHost(null);
         useTabStore.getState().addTab({ type: "terminal", id: sessionId, label: hostLabel });
       } catch (err) {
+        if (cancelled) return;
         const msg = err && typeof err === "object" && "message" in err
           ? String((err as { message: string }).message)
           : "Connection failed. Check host, port, and credentials.";
-        setConnectingHost({ label, error: msg, retry: () => void connectToHost(host) });
+        setConnectingHost({ label, error: msg, retry: () => void connectToHost(host), cancel: null });
       }
     },
     [],
@@ -232,11 +263,22 @@ export function HostsDashboard() {
   const handleRecentConnect = useCallback(
     async (conn: RecentConnection) => {
       const label = conn.host_label || `${conn.username}@${conn.host}`;
-      setConnectingHost({ label, error: null, retry: () => void handleRecentConnect(conn) });
+      const attemptId = crypto.randomUUID();
+      let cancelled = false;
+      const cancel = () => {
+        cancelled = true;
+        void cancelConnectAttempt(attemptId);
+        setConnectingHost(null);
+      };
+      setConnectingHost({ label, error: null, retry: () => void handleRecentConnect(conn), cancel });
       try {
         const { invoke } = await import("@tauri-apps/api/core");
         const addSession = useSessionStore.getState().addSession;
-        const sessionId = await invoke<string>("connect_saved_host", { hostId: conn.host_id });
+        const sessionId = await invoke<string>("connect_saved_host", { hostId: conn.host_id, attemptId });
+        if (cancelled) {
+          void invoke("ssh_disconnect", { sessionId });
+          return;
+        }
         const connLabel = conn.host_label || `${conn.username}@${conn.host}`;
         addSession(sessionId, {
           host: conn.host,
@@ -249,10 +291,11 @@ export function HostsDashboard() {
         setConnectingHost(null);
         useTabStore.getState().addTab({ type: "terminal", id: sessionId, label: connLabel });
       } catch (err) {
+        if (cancelled) return;
         const msg = err && typeof err === "object" && "message" in err
           ? String((err as { message: string }).message)
           : "Connection failed.";
-        setConnectingHost({ label, error: msg, retry: () => void handleRecentConnect(conn) });
+        setConnectingHost({ label, error: msg, retry: () => void handleRecentConnect(conn), cancel: null });
       }
     },
     [],
@@ -266,11 +309,19 @@ export function HostsDashboard() {
   const exploreHost = useCallback(
     async (host: SavedHost) => {
       const label = host.label || `${host.username}@${host.host}`;
-      setConnectingHost({ label, error: null, retry: () => void exploreHost(host) });
+      const attemptId = crypto.randomUUID();
+      let cancelled = false;
+      const cancel = () => {
+        cancelled = true;
+        void cancelConnectAttempt(attemptId);
+        setConnectingHost(null);
+      };
+      setConnectingHost({ label, error: null, retry: () => void exploreHost(host), cancel });
       try {
         const { invoke } = await import("@tauri-apps/api/core");
 
-        const sessionId = await invoke<string>("connect_saved_host_no_pty", { hostId: host.id });
+        const sessionId = await invoke<string>("connect_saved_host_no_pty", { hostId: host.id, attemptId });
+        if (cancelled) return;
 
         let explorerSessionId: string;
         let transport: "sftp" | "scp" = "sftp";
@@ -292,10 +343,11 @@ export function HostsDashboard() {
         setConnectingHost(null);
         useTabStore.getState().addTab({ type: "sftp", id: explorerSessionId, label, transport });
       } catch (err) {
+        if (cancelled) return;
         const msg = err && typeof err === "object" && "message" in err
           ? String((err as { message: string }).message)
           : "Connection failed.";
-        setConnectingHost({ label, error: msg, retry: () => void exploreHost(host) });
+        setConnectingHost({ label, error: msg, retry: () => void exploreHost(host), cancel: null });
       }
     },
     [],
@@ -651,6 +703,7 @@ export function HostsDashboard() {
           error={connectingHost.error}
           onClose={() => setConnectingHost(null)}
           onRetry={connectingHost.retry ?? undefined}
+          onCancel={connectingHost.cancel ?? undefined}
         />
       )}
     </>

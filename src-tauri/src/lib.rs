@@ -216,6 +216,7 @@ pub fn run() {
             scp::commands::scp_set_concurrency,
             // SSH
             ssh::commands::ssh_connect,
+            ssh::commands::ssh_cancel_connect,
             ssh::commands::ssh_split_session,
             ssh::commands::ssh_disconnect,
             ssh::commands::ssh_send_input,

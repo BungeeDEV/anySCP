@@ -212,7 +212,7 @@ pub async fn pf_start_tunnel(
         jump_host: None,
     };
 
-    let session_id = ssh_manager.connect_no_pty(config).await?;
+    let session_id = ssh_manager.connect_no_pty(config, None).await?;
     let handle = ssh_manager.get_handle(&session_id.0)?;
 
     // Record last_used_at

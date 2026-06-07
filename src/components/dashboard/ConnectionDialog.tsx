@@ -8,17 +8,21 @@ interface ConnectionDialogProps {
   error: string | null;
   onClose: () => void;
   onRetry?: () => void;
+  /** Abort the in-progress attempt. When set, a Cancel button is shown while connecting. */
+  onCancel?: () => void;
 }
 
-export function ConnectionDialog({ label, error, onClose, onRetry }: ConnectionDialogProps) {
-  // Close on Escape
+export function ConnectionDialog({ label, error, onClose, onRetry, onCancel }: ConnectionDialogProps) {
+  // While connecting, Escape cancels the attempt; in the error state it closes.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      if (!error && onCancel) onCancel();
+      else onClose();
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [onClose]);
+  }, [onClose, onCancel, error]);
 
   return (
     <div
@@ -85,6 +89,14 @@ export function ConnectionDialog({ label, error, onClose, onRetry }: ConnectionD
                 {label}
               </p>
             </div>
+            {onCancel && (
+              <button
+                onClick={onCancel}
+                className="mt-1 px-4 py-2 text-[length:var(--text-sm)] text-text-secondary hover:text-text-primary rounded-lg transition-colors duration-[var(--duration-fast)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Cancel
+              </button>
+            )}
           </div>
         )}
       </div>
