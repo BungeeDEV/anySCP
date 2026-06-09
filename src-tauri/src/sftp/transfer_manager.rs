@@ -899,36 +899,48 @@ async fn run_upload_file(
         .map_err(|e| SftpError::RemoteIoError(format!("Cannot write to {remote_path}: {e}")))?
     };
 
-    let mut buf = vec![0u8; CHUNK_SIZE];
+    // Stream the file. On *any* failure (cancellation, a dropped connection
+    // mid-write, a local read error) a truncated/partial file is left on the
+    // remote, so the result is inspected below and the partial removed
+    // best-effort before the error propagates.
+    let transfer = async {
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        loop {
+            if cancel_token.is_cancelled() {
+                return Err(SftpError::TransferCancelled);
+            }
 
-    loop {
-        if cancel_token.is_cancelled() {
-            // Attempt cleanup of the partial remote file.
-            let sftp = sftp_arc.lock().await;
-            let _ = sftp.remove_file(remote_path).await;
-            return Err(SftpError::TransferCancelled);
-        }
+            let n = local_file
+                .read(&mut buf)
+                .await
+                .map_err(|e| SftpError::LocalIoError(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
 
-        let n = local_file
-            .read(&mut buf)
-            .await
-            .map_err(|e| SftpError::LocalIoError(e.to_string()))?;
-        if n == 0 {
-            break;
+            remote_file
+                .write_all(&buf[..n])
+                .await
+                .map_err(|e| SftpError::RemoteIoError(e.to_string()))?;
+
+            update_progress(jobs, job_id, n as u64, cancel_token, app_handle)?;
         }
 
         remote_file
-            .write_all(&buf[..n])
+            .shutdown()
             .await
-            .map_err(|e| SftpError::RemoteIoError(e.to_string()))?;
-
-        update_progress(jobs, job_id, n as u64, cancel_token, app_handle)?;
+            .map_err(|e| SftpError::RemoteIoError(e.to_string()))
     }
+    .await;
 
-    remote_file
-        .shutdown()
-        .await
-        .map_err(|e| SftpError::RemoteIoError(e.to_string()))?;
+    if transfer.is_err() {
+        // Best-effort cleanup. On a dropped connection this will itself fail,
+        // which is fine — the goal is to avoid leaving a half-written file
+        // behind when the remote is still reachable.
+        let sftp = sftp_arc.lock().await;
+        let _ = sftp.remove_file(remote_path).await;
+    }
+    transfer?;
 
     // Mark this file done.
     if let Some(mut job) = jobs.get_mut(job_id) {

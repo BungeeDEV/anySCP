@@ -831,6 +831,10 @@ pub async fn sftp_download_to_temp(
         .map_err(|e| SftpError::LocalIoError(e.to_string()))?;
 
     let mut files = Vec::with_capacity(remote_paths.len());
+    // Tracks paths already staged in this drag so two selected entries sharing
+    // a name don't silently overwrite each other — the second is isolated in
+    // its own numbered subdir, preserving the basename dropped onto the desktop.
+    let mut used: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
 
     for remote_path in &remote_paths {
         let attrs = {
@@ -844,7 +848,19 @@ pub async fn sftp_download_to_temp(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| remote_path.clone());
-        let local_path = stage.join(&file_name);
+
+        let mut local_path = stage.join(&file_name);
+        let mut n = 1;
+        while used.contains(&local_path) {
+            local_path = stage.join(n.to_string()).join(&file_name);
+            n += 1;
+        }
+        used.insert(local_path.clone());
+        if let Some(parent) = local_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| SftpError::LocalIoError(e.to_string()))?;
+        }
 
         if attrs.file_type() == FileType::Dir {
             stage_dir(&sftp_arc, remote_path, &local_path).await?;

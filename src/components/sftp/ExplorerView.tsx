@@ -46,11 +46,70 @@ export function ExplorerView({ sessionId, transport = "sftp", isActive = true }:
   // ─── Drag-and-drop (OS → App) ─────────────────────────────────────────────
 
   const [isDragOver, setIsDragOver] = useState(false);
+  // When the cursor hovers a folder row during an OS drag, this holds that
+  // folder's path so files drop INTO it; otherwise it tracks the current dir.
+  const [dropTargetDir, setDropTargetDir] = useState<string | null>(null);
+  // Set when a drop would overwrite existing remote files, pausing the upload
+  // until the user confirms via the dialog.
+  const [pendingDrop, setPendingDrop] = useState<PendingDrop | null>(null);
   const isProcessingDrop = useRef(false);
   const currentPathRef = useRef(session?.currentPath ?? "/");
   currentPathRef.current = session?.currentPath ?? "/";
 
+  // Enqueue dropped local paths for upload, surfacing failures as a toast
+  // (the per-file transfer progress/errors still show in the transfer popover).
+  const uploadDropped = useCallback(
+    async (localPaths: string[], remoteDir: string) => {
+      try {
+        await explorerInvoke(transport, "enqueue_upload", sessionId, { localPaths, remoteDir });
+      } catch (err) {
+        toast.error(`Upload failed: ${dragErrorMessage(err)}`);
+      }
+    },
+    [sessionId, transport],
+  );
+
+  const confirmOverwrite = useCallback(() => {
+    const pd = pendingDrop;
+    setPendingDrop(null);
+    isProcessingDrop.current = false;
+    if (pd) void uploadDropped(pd.localPaths, pd.remoteDir);
+  }, [pendingDrop, uploadDropped]);
+
+  const cancelOverwrite = useCallback(() => {
+    setPendingDrop(null);
+    isProcessingDrop.current = false;
+  }, []);
+
+  // Resolve the upload destination for an OS drop/drag at the given window
+  // position. Tauri's drag-drop API has no DOM target, so we hit-test the
+  // physical-pixel position (converted to CSS pixels) against the listing: a
+  // drop on a directory row uploads into that directory, otherwise into the
+  // current directory.
+  const resolveDropDir = useCallback(
+    (position?: { x: number; y: number }): string => {
+      const base = currentPathRef.current;
+      if (!position) return base;
+      const dpr = window.devicePixelRatio || 1;
+      const el = document.elementFromPoint(position.x / dpr, position.y / dpr);
+      const row = el?.closest("[data-entry-row]") as HTMLElement | null;
+      if (row && row.dataset.entryType === "Directory") {
+        const name = row.dataset.entryName;
+        const entries = useSftpStore.getState().sessions.get(sessionId)?.entries ?? [];
+        const target = entries.find((e) => e.name === name && e.entry_type === "Directory");
+        if (target) return target.path;
+      }
+      return base;
+    },
+    [sessionId],
+  );
+
   useEffect(() => {
+    // Explorer tabs stay mounted (issue #17), so without this guard every open
+    // explorer's window-level listener would fire on a single drop and upload
+    // the files into every session at once. Only the visible tab listens.
+    if (!isActive) return;
+
     let aborted = false;
     let unlisten: (() => void) | undefined;
 
@@ -79,29 +138,45 @@ export function ExplorerView({ sessionId, transport = "sftp", isActive = true }:
           const type = event.payload?.type;
           if (type === "enter" || type === "over") {
             setIsDragOver(true);
+            setDropTargetDir(resolveDropDir(event.payload?.position));
           } else if (type === "drop") {
             setIsDragOver(false);
+            setDropTargetDir(null);
 
             const paths: string[] = event.payload?.paths ?? [];
             if (isProcessingDrop.current || paths.length === 0) return;
             isProcessingDrop.current = true;
 
-            const remoteDir = currentPathRef.current;
+            const remoteDir = resolveDropDir(event.payload?.position);
 
             void (async () => {
+              // Pre-flight overwrite check. Best-effort: if the target listing
+              // can't be fetched (e.g. permissions) we skip the prompt and let
+              // the upload proceed — a real failure surfaces in the popover.
+              let conflicts: string[] = [];
               try {
-                await explorerInvoke(transport, "enqueue_upload", sessionId, {
-                  localPaths: paths,
-                  remoteDir,
-                });
-              } catch (err) {
-                console.error("Drag-drop upload failed:", err);
-              } finally {
-                setTimeout(() => { isProcessingDrop.current = false; }, 500);
+                const existing = await explorerInvoke<SftpEntry[]>(transport, "list_dir", sessionId, { path: remoteDir });
+                const names = new Set(existing.map((e) => e.name));
+                conflicts = paths
+                  .map((p) => p.split(/[/\\]/).pop() ?? p)
+                  .filter((n) => names.has(n));
+              } catch {
+                // Skip the pre-check; proceed to upload.
               }
+
+              if (conflicts.length > 0) {
+                // Hand off to the confirm dialog — it clears the processing
+                // guard once the user responds.
+                setPendingDrop({ localPaths: paths, remoteDir, conflicts });
+                return;
+              }
+
+              await uploadDropped(paths, remoteDir);
+              setTimeout(() => { isProcessingDrop.current = false; }, 500);
             })();
           } else {
             setIsDragOver(false);
+            setDropTargetDir(null);
           }
         });
 
@@ -113,7 +188,7 @@ export function ExplorerView({ sessionId, transport = "sftp", isActive = true }:
 
     return () => { aborted = true; unlisten?.(); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, transport]);
+  }, [sessionId, transport, isActive, resolveDropDir, uploadDropped]);
 
   // ─── Auto-refresh on upload completion ────────────────────────────────────
 
@@ -336,9 +411,17 @@ export function ExplorerView({ sessionId, transport = "sftp", isActive = true }:
         if (prep.files.length === 0) return;
 
         const { startDrag } = await import("@crabnebula/tauri-plugin-drag");
-        await startDrag({ item: prep.files, icon: prep.icon });
+        // The OS gives no signal once files land on the desktop; the plugin's
+        // drag-end callback is the only completion hook, so confirm success
+        // only when the drag actually dropped (not when it was cancelled).
+        await startDrag({ item: prep.files, icon: prep.icon }, (payload) => {
+          if (payload.result === "Dropped") {
+            const n = entries.length;
+            toast.success(`Downloaded ${n} ${n === 1 ? "item" : "items"}`);
+          }
+        });
       } catch (err) {
-        console.error("Drag-out download failed:", err);
+        toast.error(`Download failed: ${dragErrorMessage(err)}`);
       }
     })();
   }, [sessionId, transport]);
@@ -665,9 +748,105 @@ export function ExplorerView({ sessionId, transport = "sftp", isActive = true }:
         busy={busy}
       />
 
-      {isDragOver && <ExplorerDropZone path={session.currentPath} />}
+      {isDragOver && (
+        <ExplorerDropZone
+          path={dropTargetDir ?? session.currentPath}
+          intoFolder={!!dropTargetDir && dropTargetDir !== session.currentPath}
+        />
+      )}
+
+      {pendingDrop && (
+        <DropOverwriteDialog
+          conflicts={pendingDrop.conflicts}
+          targetDir={pendingDrop.remoteDir}
+          onConfirm={confirmOverwrite}
+          onCancel={cancelOverwrite}
+        />
+      )}
     </div>
   );
+}
+
+// ─── Drag-drop overwrite confirmation ────────────────────────────────────────
+
+interface PendingDrop {
+  localPaths: string[];
+  remoteDir: string;
+  conflicts: string[];
+}
+
+function DropOverwriteDialog({
+  conflicts,
+  targetDir,
+  onConfirm,
+  onCancel,
+}: {
+  conflicts: string[];
+  targetDir: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const count = conflicts.length;
+  return (
+    <div
+      data-testid="explorer-overwrite-confirm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+      onClick={(e) => e.target === e.currentTarget && onCancel()}
+    >
+      <div className="w-full max-w-sm mx-4 rounded-xl bg-bg-overlay border border-border p-6 shadow-[var(--shadow-lg)]">
+        <h2 className="text-[length:var(--text-lg)] font-semibold text-text-primary mb-2">
+          {count === 1 ? "Overwrite file?" : `Overwrite ${count} files?`}
+        </h2>
+        <p className="text-[length:var(--text-sm)] text-text-secondary mb-3">
+          {count === 1 ? (
+            <>
+              <span className="font-mono text-text-primary">{conflicts[0]}</span> already exists
+              here and will be replaced.
+            </>
+          ) : (
+            <>{count} files already exist here and will be replaced.</>
+          )}
+        </p>
+        {count > 1 && (
+          <ul className="mb-3 max-h-32 overflow-y-auto rounded-md bg-bg-base border border-border/60 p-2 flex flex-col gap-0.5">
+            {conflicts.map((n) => (
+              <li key={n} className="font-mono text-[length:var(--text-2xs)] text-text-secondary truncate">
+                {n}
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="font-mono text-[length:var(--text-2xs)] text-text-muted truncate mb-5">
+          {targetDir}
+        </p>
+
+        <div className="flex justify-end gap-2">
+          <button
+            data-testid="explorer-overwrite-cancel"
+            onClick={onCancel}
+            className="px-4 py-2 text-[length:var(--text-sm)] text-text-secondary hover:text-text-primary rounded-lg transition-colors duration-[var(--duration-fast)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Cancel
+          </button>
+          <button
+            data-testid="explorer-overwrite-confirm-button"
+            onClick={onConfirm}
+            className="px-4 py-2 text-[length:var(--text-sm)] font-medium text-white bg-accent hover:opacity-90 rounded-lg transition-[opacity] duration-[var(--duration-fast)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {count === 1 ? "Overwrite" : `Overwrite ${count}`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Extract a human-readable message from a Tauri/SftpError rejection. */
+function dragErrorMessage(err: unknown): string {
+  if (err && typeof err === "object" && "message" in err) {
+    return String((err as { message: string }).message);
+  }
+  return typeof err === "string" ? err : "Unexpected error";
 }
 
 // ─── Internal type for Tauri drag-drop event ─────────────────────────────────
