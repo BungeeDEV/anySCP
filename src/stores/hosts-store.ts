@@ -128,8 +128,16 @@ if (typeof window !== "undefined") {
     __e2eBackupImport?: (password: string, path: string) => Promise<void>;
     __e2eFactoryReset?: () => Promise<void>;
     __e2eDataCounts?: () => Promise<{ hosts: number; groups: number; snippets: number }>;
+    __e2eHostOrder?: () => Promise<string[]>;
   };
   w.__e2eDuplicateHost = (id) => useHostsStore.getState().duplicateHost(id);
+  // Persisted host order (labels) — lets the reorder E2E spec confirm the async
+  // backend write landed before relaunching to verify it survives a restart.
+  w.__e2eHostOrder = async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const hosts = await invoke<SavedHost[]>("list_hosts");
+    return hosts.map((h) => h.label);
+  };
   w.__e2eBackupExport = async (password, path) => {
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("backup_export", { password, path });

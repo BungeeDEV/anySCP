@@ -591,6 +591,7 @@ export function HostsDashboard() {
               >
                 Groups
               </h2>
+              {/* TODO: keyboard reordering (accessibility) */}
               <DndContext
                 sensors={sensors}
                 collisionDetection={closestCenter}
@@ -646,6 +647,7 @@ export function HostsDashboard() {
 
             {/* Host grid or empty state */}
             {filteredHosts.length > 0 ? (
+              /* TODO: keyboard reordering (accessibility) */
               <DndContext
                 sensors={sensors}
                 collisionDetection={closestCenter}
