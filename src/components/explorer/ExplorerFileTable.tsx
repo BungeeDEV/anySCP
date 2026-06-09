@@ -58,6 +58,10 @@ interface ExplorerFileTableProps {
   onPaste?: () => void;
   onMoveEntries?: (sourceIds: string[], targetDir: string) => Promise<void>;
   onCopyEntries?: (sourceIds: string[], targetDir: string) => Promise<void>;
+  /** Drag selected files out to the OS (download to desktop/Finder). When
+   *  provided, dragging a file-only selection starts a native OS drag instead
+   *  of an in-app move. Absent for providers without OS drag-out support. */
+  onDragOut?: (entries: ExplorerEntry[]) => void;
   /** Current directory path/prefix. Used to reset scroll on navigation while
    *  preserving it across same-directory refreshes (e.g. after a chmod). */
   currentPath?: string;
@@ -279,6 +283,7 @@ export function ExplorerFileTable({
   onPaste,
   onMoveEntries,
   onCopyEntries,
+  onDragOut,
   currentPath,
   loading,
 }: ExplorerFileTableProps) {
@@ -808,11 +813,35 @@ export function ExplorerFileTable({
                       }
                     }
                   }}
-                  // Internal drag-drop (move between folders)
-                  draggable={caps.canInternalDragMove}
-                  onDragStart={caps.canInternalDragMove ? (e) => {
+                  // Drag-out to OS (download) for files; internal move for folders.
+                  draggable={caps.canInternalDragMove || !!onDragOut}
+                  onDragStart={(caps.canInternalDragMove || onDragOut) ? (e) => {
                     const entriesToDrag = selectedIds.has(entry.id) && selectedIds.size > 1
                       ? selectedEntries : [entry];
+
+                    // Drag-out to the OS (download to desktop/Finder), for both
+                    // files and folders (folders are staged recursively). The
+                    // HTML5 DataTransfer API CANNOT create real OS files from a
+                    // Tauri webview — setting "text/plain" (or even a
+                    // "DownloadURL") only makes the OS write a junk text blob,
+                    // which is exactly the "odd binary file" bug. OS-level file
+                    // drops require a native drag session (tauri-plugin-drag)
+                    // seeded with real, already-downloaded local paths. So we
+                    // cancel the HTML5 drag and hand off to onDragOut, which
+                    // stages every selected entry and starts the native drag.
+                    if (onDragOut && entriesToDrag.length > 0) {
+                      e.preventDefault();
+                      onDragOut(entriesToDrag);
+                      return;
+                    }
+
+                    // No OS drag-out available (e.g. SCP/S3) → fall back to the
+                    // in-app move-between-folders drag, which stays within the
+                    // webview and is handled by the HTML5 drop targets below.
+                    if (!caps.canInternalDragMove) {
+                      e.preventDefault();
+                      return;
+                    }
                     draggedEntriesRef.current = entriesToDrag;
                     e.dataTransfer.effectAllowed = "copyMove";
                     e.dataTransfer.setData("text/plain", entriesToDrag.map((en) => en.name).join(", "));

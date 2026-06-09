@@ -694,6 +694,179 @@ pub async fn sftp_download(
     Ok(transfer_id)
 }
 
+/// Preview image handed to the OS drag session. Embedded so we don't depend on
+/// a resolvable bundle-resource path at runtime.
+static DRAG_ICON_PNG: &[u8] = include_bytes!("../../icons/32x32.png");
+
+/// Result of staging files for an OS-level drag-out.
+#[derive(serde::Serialize)]
+pub struct DragOutPrep {
+    /// Absolute local paths of the staged files, ready to hand to the drag plugin.
+    pub files: Vec<String>,
+    /// Absolute local path of the drag-preview image (required by `startDrag`).
+    pub icon: String,
+}
+
+/// Stream one remote file to a local path. The session lock is held only for
+/// the `open()` call; the byte copy runs lock-free (the file handle talks to
+/// the SSH channel on its own) so other SFTP ops aren't blocked — mirrors
+/// `download_task`.
+async fn stage_file(
+    sftp_arc: &Arc<tokio::sync::Mutex<russh_sftp::client::SftpSession>>,
+    remote_path: &str,
+    local_path: &std::path::Path,
+) -> Result<(), SftpError> {
+    let mut remote_file = {
+        let sftp = sftp_arc.lock().await;
+        sftp.open(remote_path)
+            .await
+            .map_err(|e| SftpError::RemoteIoError(e.to_string()))?
+    };
+
+    let mut local_file = tokio::fs::File::create(local_path)
+        .await
+        .map_err(|e| SftpError::LocalIoError(e.to_string()))?;
+
+    const CHUNK: usize = 32 * 1024; // 32 KB
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = remote_file
+            .read(&mut buf)
+            .await
+            .map_err(|e| SftpError::RemoteIoError(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        local_file
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| SftpError::LocalIoError(e.to_string()))?;
+    }
+    local_file
+        .flush()
+        .await
+        .map_err(|e| SftpError::LocalIoError(e.to_string()))?;
+    remote_file
+        .shutdown()
+        .await
+        .map_err(|e| SftpError::RemoteIoError(e.to_string()))?;
+    Ok(())
+}
+
+/// Recursively stage a remote directory tree under `local_dir`, preserving
+/// structure. Walks iteratively (an explicit stack) to avoid boxing async
+/// recursion. Symlinks and other special entries are skipped — we only descend
+/// real directories and copy regular files, which also guards against symlink
+/// loops.
+async fn stage_dir(
+    sftp_arc: &Arc<tokio::sync::Mutex<russh_sftp::client::SftpSession>>,
+    remote_dir: &str,
+    local_dir: &std::path::Path,
+) -> Result<(), SftpError> {
+    let mut stack = vec![(remote_dir.to_string(), local_dir.to_path_buf())];
+
+    while let Some((rdir, ldir)) = stack.pop() {
+        tokio::fs::create_dir_all(&ldir)
+            .await
+            .map_err(|e| SftpError::LocalIoError(e.to_string()))?;
+
+        // read_dir already skips "." and ".." entries internally.
+        let entries = {
+            let sftp = sftp_arc.lock().await;
+            sftp.read_dir(&rdir)
+                .await
+                .map_err(|e| SftpError::RemoteIoError(e.to_string()))?
+        };
+
+        for entry in entries {
+            let name = entry.file_name();
+            let rpath = if rdir == "/" {
+                format!("/{name}")
+            } else {
+                format!("{rdir}/{name}")
+            };
+            let lpath = ldir.join(&name);
+
+            match entry.metadata().file_type() {
+                FileType::Dir => stack.push((rpath, lpath)),
+                FileType::File => stage_file(sftp_arc, &rpath, &lpath).await?,
+                _ => {} // skip symlinks / specials
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Download remote files **and folders** to a temp staging directory and return
+/// their local paths, **awaiting completion**.
+///
+/// This backs drag-to-desktop ("drag-out"). Unlike `sftp_download` — which is
+/// fire-and-forget and streams progress events — the native OS drag API
+/// (tauri-plugin-drag) needs real, fully-written local file handles *before*
+/// the drag begins, so this resolves only once every byte is on disk.
+///
+/// Every selected entry is staged (fixing the "only one file downloaded"
+/// multi-select bug); directories are copied recursively, preserving their
+/// tree. Each call stages into a unique subdir so same-named entries from
+/// different directories and concurrent drags don't collide. We don't delete
+/// the staged files — the OS copies them out asynchronously on drop and gives
+/// us no completion signal — so cleanup is left to the OS temp reaper.
+#[tauri::command]
+#[instrument(skip(sftp_manager), fields(sftp_session_id = %sftp_session_id))]
+pub async fn sftp_download_to_temp(
+    sftp_session_id: String,
+    remote_paths: Vec<String>,
+    sftp_manager: State<'_, Arc<SftpManager>>,
+) -> Result<DragOutPrep, SftpError> {
+    let sftp_arc = {
+        let session_ref = sftp_manager.get_session(&sftp_session_id)?;
+        session_ref.sftp.clone()
+    };
+
+    let stage = std::env::temp_dir()
+        .join("anyscp-dragout")
+        .join(uuid::Uuid::new_v4().to_string());
+    tokio::fs::create_dir_all(&stage)
+        .await
+        .map_err(|e| SftpError::LocalIoError(e.to_string()))?;
+
+    let mut files = Vec::with_capacity(remote_paths.len());
+
+    for remote_path in &remote_paths {
+        let attrs = {
+            let sftp = sftp_arc.lock().await;
+            sftp.metadata(remote_path)
+                .await
+                .map_err(|e| SftpError::RemoteIoError(e.to_string()))?
+        };
+
+        let file_name = std::path::Path::new(remote_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| remote_path.clone());
+        let local_path = stage.join(&file_name);
+
+        if attrs.file_type() == FileType::Dir {
+            stage_dir(&sftp_arc, remote_path, &local_path).await?;
+        } else {
+            stage_file(&sftp_arc, remote_path, &local_path).await?;
+        }
+
+        files.push(local_path.to_string_lossy().to_string());
+    }
+
+    // `startDrag` requires a preview image path; write our app icon alongside.
+    let icon_path = stage.join("drag-icon.png");
+    tokio::fs::write(&icon_path, DRAG_ICON_PNG)
+        .await
+        .map_err(|e| SftpError::LocalIoError(e.to_string()))?;
+
+    Ok(DragOutPrep {
+        files,
+        icon: icon_path.to_string_lossy().to_string(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_task(
     sftp_arc: Arc<tokio::sync::Mutex<russh_sftp::client::SftpSession>>,

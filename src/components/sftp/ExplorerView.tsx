@@ -312,6 +312,37 @@ export function ExplorerView({ sessionId, transport = "sftp", isActive = true }:
     }
   }, [sessionId, transport]);
 
+  // ─── Drag-out (Explorer → OS desktop/Finder) ──────────────────────────────
+  //
+  // Staging downloads every selected entry to a temp dir — files directly,
+  // folders recursively (fixing the old "only one file" bug) — then hands the
+  // real local paths to the native drag plugin. We must download *before*
+  // starting the drag because the OS drag API needs concrete file handles up
+  // front — see the drag-out comment in ExplorerFileTable for why HTML5
+  // DataTransfer can't do this in a webview.
+  //
+  // SCP has no `download_to_temp` command, so drag-out is wired for SFTP only
+  // (see the `onDragOut` prop below); SCP sessions keep the in-app move drag.
+  const handleDragOut = useCallback((entries: ExplorerEntry[]) => {
+    void (async () => {
+      try {
+        const remotePaths = entries.map((en) => en.id);
+        const prep = await explorerInvoke<{ files: string[]; icon: string }>(
+          transport,
+          "download_to_temp",
+          sessionId,
+          { remotePaths },
+        );
+        if (prep.files.length === 0) return;
+
+        const { startDrag } = await import("@crabnebula/tauri-plugin-drag");
+        await startDrag({ item: prep.files, icon: prep.icon });
+      } catch (err) {
+        console.error("Drag-out download failed:", err);
+      }
+    })();
+  }, [sessionId, transport]);
+
   // ─── Upload (dialog) ─────────────────────────────────────────────────────
 
   const handleUpload = useCallback(async () => {
@@ -628,6 +659,7 @@ export function ExplorerView({ sessionId, transport = "sftp", isActive = true }:
         onPaste={() => void handlePaste()}
         onMoveEntries={handleMoveEntries}
         onCopyEntries={handleCopyEntries}
+        onDragOut={transport === "sftp" ? handleDragOut : undefined}
         currentPath={session.currentPath}
         loading={session.loading}
         busy={busy}
