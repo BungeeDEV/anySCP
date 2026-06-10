@@ -110,14 +110,7 @@ export function GroupModal({ open, onClose, onSave, initial }: GroupModalProps) 
       open={open}
       onClose={onClose}
       title={isEdit ? "Edit Group" : "New Group"}
-      iconNode={
-        <div
-          className="flex items-center justify-center w-8 h-8 rounded-lg shrink-0"
-          style={{ backgroundColor: `${color}20` }}
-        >
-          <SelectedIcon size={16} strokeWidth={1.8} style={{ color }} aria-hidden="true" />
-        </div>
-      }
+      icon={SelectedIcon}
       maxWidth="sm"
       busy={saving}
       testId="group-modal"

@@ -78,14 +78,7 @@ export function SnippetFolderModal({ open, onClose, onSave }: SnippetFolderModal
       open={open}
       onClose={onClose}
       title="New Folder"
-      iconNode={
-        <div
-          className="flex items-center justify-center w-8 h-8 rounded-lg shrink-0"
-          style={{ backgroundColor: `${color}20` }}
-        >
-          <Folder size={16} strokeWidth={1.8} style={{ color }} aria-hidden="true" />
-        </div>
-      }
+      icon={Folder}
       maxWidth="sm"
       busy={saving}
       footer={
