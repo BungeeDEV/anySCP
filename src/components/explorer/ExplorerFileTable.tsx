@@ -299,10 +299,11 @@ export function ExplorerFileTable({
   const lastClickedId = useRef<string | null>(null);
   const tableRef = useRef<HTMLDivElement>(null);
 
-  // Drag-and-drop state (internal move)
+  // Drag-and-drop state (internal move). The OS-level Tauri drag-drop handler is
+  // enabled (for file-drop uploads), which suppresses HTML5 drag events in the
+  // webview — so internal move/copy is driven by pointer events, not `draggable`.
   const [dragOverId, setDragOverId] = useState<string | null>(null);
-  const draggedEntriesRef = useRef<ExplorerEntry[]>([]);
-  const dragEnterCountRef = useRef(0);
+  const [dragGhost, setDragGhost] = useState<{ x: number; y: number; count: number; copy: boolean } | null>(null);
 
   // Reset scroll to the top only when the directory actually changes. Same-dir
   // refreshes (e.g. after a chmod / rename / create) keep the scroll container
@@ -443,6 +444,102 @@ export function ExplorerFileTable({
   };
 
   const selectedEntries = sortedEntries.filter((e) => selectedIds.has(e.id));
+
+  // ─── Internal drag (pointer-based) ─────────────────────────────────────────
+  //
+  // HTML5 drag-and-drop doesn't fire in the webview while Tauri's OS drag-drop
+  // handler is enabled (it is, for file-drop uploads), so internal move/copy is
+  // driven by pointer events. On a >5px move we either hand off to the native
+  // OS drag-out (primary modifier) or begin an in-app drag whose destination
+  // folder is hit-tested with elementFromPoint and committed on pointer-up
+  // (Alt = copy). A plain click never crosses the threshold, so selection and
+  // double-click are unaffected.
+  const handleRowPointerDown = useCallback(
+    (e: React.PointerEvent, entry: ExplorerEntry) => {
+      if (e.button !== 0 || renamingId) return;
+      if (!(caps.canInternalDragMove || onDragOut)) return;
+      if ((e.target as HTMLElement).closest("input")) return;
+
+      const dragEntries =
+        selectedIds.has(entry.id) && selectedIds.size > 1 ? selectedEntries : [entry];
+      const startX = e.clientX;
+      const startY = e.clientY;
+      let started = false;
+      let moving = false;
+
+      // Resolve the directory row under a point to a valid drop target id, or
+      // null (not a dir, or dropping onto self / into the dragged subtree).
+      const folderTargetAt = (x: number, y: number): string | null => {
+        const row = (document.elementFromPoint(x, y) as HTMLElement | null)?.closest(
+          "[data-entry-row]",
+        ) as HTMLElement | null;
+        if (!row || row.dataset.entryType !== "Directory") return null;
+        const target = entries.find(
+          (en) => en.name === row.dataset.entryName && en.entryType === "Directory",
+        );
+        if (!target) return null;
+        const ids = dragEntries.map((s) => s.id);
+        if (ids.includes(target.id) || ids.some((p) => target.id.startsWith(p + "/"))) return null;
+        return target.id;
+      };
+
+      const onMove = (ev: PointerEvent) => {
+        if (!started) {
+          if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 5) return;
+          started = true;
+          // Primary modifier (⌘/Ctrl) → native OS drag-out, which takes over.
+          if ((ev.metaKey || ev.ctrlKey) && onDragOut) {
+            teardown();
+            onDragOut(dragEntries);
+            return;
+          }
+          if (!caps.canInternalDragMove) {
+            teardown();
+            return;
+          }
+          moving = true;
+        }
+        if (moving) {
+          setDragOverId(folderTargetAt(ev.clientX, ev.clientY));
+          setDragGhost({ x: ev.clientX, y: ev.clientY, count: dragEntries.length, copy: ev.altKey });
+        }
+      };
+
+      const onUp = (ev: PointerEvent) => {
+        if (moving) {
+          const targetId = folderTargetAt(ev.clientX, ev.clientY);
+          if (targetId) {
+            const handler = ev.altKey ? onCopyEntries : onMoveEntries;
+            void handler?.(
+              dragEntries.map((s) => s.id),
+              targetId,
+            );
+          }
+        }
+        teardown();
+      };
+
+      function teardown() {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        setDragOverId(null);
+        setDragGhost(null);
+      }
+
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    [
+      caps.canInternalDragMove,
+      onDragOut,
+      onMoveEntries,
+      onCopyEntries,
+      selectedIds,
+      selectedEntries,
+      entries,
+      renamingId,
+    ],
+  );
 
   // ─── Row actions ──────────────────────────────────────────────────────────
 
@@ -664,7 +761,7 @@ export function ExplorerFileTable({
     <>
       <div
         ref={tableRef}
-        className="flex-1 overflow-y-auto"
+        className={`flex-1 overflow-y-auto${dragGhost ? " select-none" : ""}`}
         onClick={(e) => {
           const target = e.target as Element;
           if (!target.closest("[data-entry-row]")) setSelectedIds(new Set());
@@ -814,79 +911,12 @@ export function ExplorerFileTable({
                       }
                     }
                   }}
-                  // Plain drag = internal move; Alt-drag = internal copy;
-                  // primary-modifier drag (⌘/Ctrl) = native drag-out to the OS.
-                  draggable={caps.canInternalDragMove || !!onDragOut}
-                  onDragStart={(caps.canInternalDragMove || onDragOut) ? (e) => {
-                    const entriesToDrag = selectedIds.has(entry.id) && selectedIds.size > 1
-                      ? selectedEntries : [entry];
-
-                    // Primary-modifier drag (⌘ on macOS, Ctrl elsewhere) downloads
-                    // the selection to the OS (desktop/Finder). Alt is reserved
-                    // for internal copy, so it must NOT trigger drag-out. The
-                    // HTML5 DataTransfer API CANNOT create real OS files from a
-                    // Tauri webview — setting "text/plain" (or "DownloadURL")
-                    // only writes a junk text blob (the "odd binary file" bug).
-                    // OS-level file drops need a native drag seeded with real
-                    // local paths, so we cancel the HTML5 drag and hand off to
-                    // onDragOut, which stages the entries in the backend and
-                    // starts the native drag.
-                    if (onDragOut && (e.metaKey || e.ctrlKey)) {
-                      e.preventDefault();
-                      onDragOut(entriesToDrag);
-                      return;
-                    }
-
-                    // Safety net: a provider that offers drag-out but no in-app
-                    // move would reach here on a plain (non-modifier) drag — cancel
-                    // it so we don't start a broken HTML5 drag session. (Today
-                    // every drag-out provider also has canInternalDragMove, so this
-                    // is unreachable, but it keeps the gesture logic honest.)
-                    if (!caps.canInternalDragMove) {
-                      e.preventDefault();
-                      return;
-                    }
-
-                    // In-app move/copy between folders, handled by the row drop
-                    // targets below (Alt selects copy vs. move there).
-                    draggedEntriesRef.current = entriesToDrag;
-                    e.dataTransfer.effectAllowed = "copyMove";
-                    e.dataTransfer.setData("text/plain", entriesToDrag.map((en) => en.name).join(", "));
-                  } : undefined}
-                  onDragEnd={caps.canInternalDragMove ? () => {
-                    draggedEntriesRef.current = [];
-                    setDragOverId(null);
-                    dragEnterCountRef.current = 0;
-                  } : undefined}
-                  onDragOver={caps.canInternalDragMove && entry.entryType === "Directory" ? (e) => {
-                    e.preventDefault();
-                    e.dataTransfer.dropEffect = e.altKey ? "copy" : "move";
-                  } : undefined}
-                  onDragEnter={caps.canInternalDragMove && entry.entryType === "Directory" ? (e) => {
-                    e.preventDefault();
-                    dragEnterCountRef.current++;
-                    setDragOverId(entry.id);
-                  } : undefined}
-                  onDragLeave={caps.canInternalDragMove && entry.entryType === "Directory" ? () => {
-                    dragEnterCountRef.current--;
-                    if (dragEnterCountRef.current <= 0) {
-                      setDragOverId(null);
-                      dragEnterCountRef.current = 0;
-                    }
-                  } : undefined}
-                  onDrop={caps.canInternalDragMove && entry.entryType === "Directory" ? (e) => {
-                    e.preventDefault();
-                    setDragOverId(null);
-                    dragEnterCountRef.current = 0;
-                    const sources = draggedEntriesRef.current;
-                    if (sources.length === 0) return;
-                    const sourceIds = sources.map((s) => s.id);
-                    if (sourceIds.includes(entry.id)) return;
-                    if (sourceIds.some((p) => entry.id.startsWith(p + "/"))) return;
-                    const handler = e.altKey ? onCopyEntries : onMoveEntries;
-                    void handler?.(sourceIds, entry.id);
-                    draggedEntriesRef.current = [];
-                  } : undefined}
+                  // Internal move/copy is pointer-driven (HTML5 DnD is suppressed
+                  // by the OS drag-drop handler). A primary-modifier drag hands
+                  // off to the native OS drag-out; plain = move, Alt = copy.
+                  onPointerDown={(caps.canInternalDragMove || onDragOut)
+                    ? (e) => handleRowPointerDown(e, entry)
+                    : undefined}
                   className={[
                     "flex items-center gap-2 px-3 py-2 cursor-default",
                     "transition-colors duration-[var(--duration-fast)]",
@@ -969,6 +999,16 @@ export function ExplorerFileTable({
           onApplyPermissions={onApplyPermissions}
           onClose={() => setPropsEntry(null)}
         />
+      )}
+
+      {/* Drag ghost for the pointer-driven internal move/copy. */}
+      {dragGhost && (
+        <div
+          className="fixed z-50 pointer-events-none rounded-md bg-accent px-2 py-1 text-[length:var(--text-2xs)] font-medium text-white shadow-[var(--shadow-md)]"
+          style={{ left: dragGhost.x + 12, top: dragGhost.y + 8 }}
+        >
+          {`${dragGhost.copy ? "Copy" : "Move"} ${dragGhost.count} ${dragGhost.count === 1 ? "item" : "items"}`}
+        </div>
       )}
     </>
   );
