@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId } from "react";
 import { AlertTriangle, X } from "lucide-react";
 
 interface ConfirmDangerDialogProps {
@@ -23,61 +23,35 @@ export function ConfirmDangerDialog({
   onCancel,
 }: ConfirmDangerDialogProps) {
   const titleId = useId();
-  const [visible, setVisible] = useState(false);
-  const cancelRef = useRef<HTMLButtonElement>(null);
-  const backdropRef = useRef<HTMLDivElement>(null);
 
-  // Drive the entrance animation separately from open so the panel
-  // fades/slides in after the backdrop is painted.
+  // Escape closes the dialog — document listener matches GroupDeleteDialog and
+  // HostEditModal so it fires regardless of which element has focus.
   useEffect(() => {
-    if (open) {
-      requestAnimationFrame(() => setVisible(true));
-    } else {
-      setVisible(false);
-    }
-  }, [open]);
-
-  // Focus the Cancel button once the panel is visible.
-  useEffect(() => {
-    if (visible) requestAnimationFrame(() => cancelRef.current?.focus());
-  }, [visible]);
+    if (!open) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !busy) {
+        e.stopPropagation();
+        onCancel();
+      }
+    };
+    document.addEventListener("keydown", handler, true);
+    return () => document.removeEventListener("keydown", handler, true);
+  }, [open, busy, onCancel]);
 
   if (!open) return null;
 
-  const handleBackdropClick = (e: React.MouseEvent) => {
-    if (e.target === backdropRef.current && !busy) onCancel();
-  };
-
-  // Keyboard: Escape cancels; Enter inside the form submits (handled by onSubmit).
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Escape" && !busy) {
-      e.stopPropagation();
-      onCancel();
-    }
-  };
-
   return (
     <div
-      ref={backdropRef}
-      onClick={handleBackdropClick}
-      className={[
-        "fixed inset-0 z-50 flex items-start justify-center pt-[8vh]",
-        "transition-[background-color,backdrop-filter] duration-[var(--duration-base)]",
-        visible ? "bg-black/50 backdrop-blur-sm" : "bg-black/0 backdrop-blur-none",
-      ].join(" ")}
+      className="fixed inset-0 z-50 flex items-start justify-center pt-[8vh] bg-black/50 backdrop-blur-sm"
+      onClick={(e) => { if (e.target === e.currentTarget && !busy) onCancel(); }}
     >
+      {/* Wrap in a form so Enter on the focused Confirm button submits naturally */}
       <form
         onSubmit={(e) => { e.preventDefault(); if (!busy) onConfirm(); }}
-        onKeyDown={handleKeyDown}
         aria-modal="true"
         role="dialog"
         aria-labelledby={titleId}
-        className={[
-          "w-full max-w-sm rounded-xl bg-bg-overlay border border-border shadow-[var(--shadow-lg)]",
-          "flex flex-col",
-          "transition-[opacity,transform] duration-[var(--duration-slow)] ease-[var(--ease-expo-out)]",
-          visible ? "opacity-100 translate-y-0" : "opacity-0 -translate-y-3",
-        ].join(" ")}
+        className="w-full max-w-sm rounded-xl bg-bg-overlay border border-border shadow-[var(--shadow-lg)] flex flex-col animate-in fade-in slide-in-from-top-2 duration-[var(--duration-base)]"
       >
         {/* Header */}
         <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-border shrink-0">
@@ -85,7 +59,7 @@ export function ConfirmDangerDialog({
             <div className="flex items-center justify-center w-7 h-7 rounded-md shrink-0 bg-status-error/10">
               <AlertTriangle size={15} strokeWidth={1.8} className="text-status-error" aria-hidden="true" />
             </div>
-            <h2 id={titleId} className="text-[length:var(--text-base)] font-semibold text-text-primary">
+            <h2 id={titleId} className="text-[length:var(--text-lg)] font-semibold text-text-primary">
               {title}
             </h2>
           </div>
@@ -108,7 +82,10 @@ export function ConfirmDangerDialog({
         {/* Footer */}
         <div className="px-6 pb-5 pt-3 flex items-center justify-end gap-2 border-t border-border shrink-0">
           <button
-            ref={cancelRef}
+            // autoFocus lands on Cancel (the safe default) synchronously on mount.
+            // This is more reliable than a requestAnimationFrame focus() call.
+            // eslint-disable-next-line jsx-a11y/no-autofocus
+            autoFocus
             type="button"
             onClick={onCancel}
             disabled={busy}
