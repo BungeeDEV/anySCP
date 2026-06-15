@@ -32,7 +32,7 @@ import { useS3Store } from "../../stores/s3-store";
 import type { SavedHost, HostGroup, RecentConnection, S3Connection } from "../../types";
 import { SortableHostCard } from "./SortableHostCard";
 import { SortableGroupCard } from "./SortableGroupCard";
-import { S3Card } from "./S3Card";
+import { SortableS3Card } from "./SortableS3Card";
 import { GroupDeleteDialog } from "./GroupDeleteDialog";
 import { GroupModal } from "./GroupModal";
 import { ConnectionDialog } from "./ConnectionDialog";
@@ -402,6 +402,44 @@ export function HostsDashboard() {
     [groups, reorderGroups],
   );
 
+  // Reorder the S3 connection cards. Its own DndContext over the Cloud Storage
+  // grid. S3 connections live in local component state (not a store), so the
+  // optimistic update + rollback are inline here. Like the host handler, we
+  // reorder the visible subset then splice it back into the full list so
+  // connections hidden by a group/search filter keep their positions.
+  const handleS3DragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event;
+      if (!over || active.id === over.id) return;
+
+      const oldIndex = filteredS3.findIndex((c) => c.id === active.id);
+      const newIndex = filteredS3.findIndex((c) => c.id === over.id);
+      if (oldIndex === -1 || newIndex === -1) return;
+
+      const reorderedVisible = arrayMove(filteredS3, oldIndex, newIndex);
+      const visibleIds = new Set(filteredS3.map((c) => c.id));
+      let cursor = 0;
+      const newFullOrder = s3Connections.map((c) =>
+        visibleIds.has(c.id) ? reorderedVisible[cursor++] : c,
+      );
+
+      const previous = s3Connections;
+      setS3Connections(newFullOrder); // optimistic — UI updates instantly
+      void (async () => {
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          await invoke("reorder_s3_connections", {
+            orderedIds: newFullOrder.map((c) => c.id),
+          });
+        } catch {
+          setS3Connections(previous); // roll back so display matches storage
+          toast.error("Couldn't save the new connection order — reverted.");
+        }
+      })();
+    },
+    [filteredS3, s3Connections],
+  );
+
   // ─── Group handlers ────────────────────────────────────────────────────────
 
   const handleGroupSelect = (groupId: string) => {
@@ -690,18 +728,30 @@ export function HostsDashboard() {
               >
                 Cloud Storage
               </h2>
-              <div className="grid grid-cols-3 gap-2.5">
-                {filteredS3.map((conn) => (
-                  <S3Card
-                    key={conn.id}
-                    conn={conn}
-                    onConnect={(c) => void handleS3Connect(c)}
-                    onEdit={(c) => setEditingS3Connection(c)}
-                    onDuplicate={(c) => void handleS3Duplicate(c)}
-                    onDelete={(c) => void handleS3Delete(c)}
-                  />
-                ))}
-              </div>
+              {/* TODO: keyboard reordering (accessibility) */}
+              <DndContext
+                sensors={sensors}
+                collisionDetection={closestCenter}
+                onDragEnd={handleS3DragEnd}
+              >
+                <SortableContext
+                  items={filteredS3.map((c) => c.id)}
+                  strategy={rectSortingStrategy}
+                >
+                  <div className="grid grid-cols-3 gap-2.5">
+                    {filteredS3.map((conn) => (
+                      <SortableS3Card
+                        key={conn.id}
+                        conn={conn}
+                        onConnect={(c) => void handleS3Connect(c)}
+                        onEdit={(c) => setEditingS3Connection(c)}
+                        onDuplicate={(c) => void handleS3Duplicate(c)}
+                        onDelete={(c) => void handleS3Delete(c)}
+                      />
+                    ))}
+                  </div>
+                </SortableContext>
+              </DndContext>
             </section>
           )}
         </div>

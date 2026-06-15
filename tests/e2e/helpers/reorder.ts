@@ -22,6 +22,16 @@ export async function domGroupOrder(): Promise<string[]> {
     return names;
 }
 
+/** Labels of the S3 connection cards in current DOM order. */
+export async function domS3Order(): Promise<string[]> {
+    const cards = await $$("[data-s3-id]");
+    const labels: string[] = [];
+    for (const card of cards) {
+        labels.push((await card.getAttribute("data-s3-label")) ?? "");
+    }
+    return labels;
+}
+
 /** Host labels in persisted (DB) order — confirms the async write landed. */
 export async function persistedHostOrder(): Promise<string[]> {
     return browser.execute(async () => {
@@ -40,6 +50,17 @@ export async function persistedGroupOrder(): Promise<string[]> {
             __e2eGroupOrder?: () => Promise<string[]>;
         }).__e2eGroupOrder;
         if (!fn) throw new Error("__e2eGroupOrder not registered");
+        return fn();
+    });
+}
+
+/** S3 connection labels in persisted (DB) order — confirms the async write landed. */
+export async function persistedS3Order(): Promise<string[]> {
+    return browser.execute(async () => {
+        const fn = (window as unknown as {
+            __e2eS3Order?: () => Promise<string[]>;
+        }).__e2eS3Order;
+        if (!fn) throw new Error("__e2eS3Order not registered");
         return fn();
     });
 }
@@ -83,6 +104,15 @@ export async function waitForPersistedHostOrder(expected: string[]): Promise<voi
         async () =>
             JSON.stringify(await persistedHostOrder()) === JSON.stringify(expected),
         { timeout: 10_000, timeoutMsg: "host order did not persist to the backend" },
+    );
+}
+
+/** Wait until the persisted S3 order equals `expected` (JSON compared). */
+export async function waitForPersistedS3Order(expected: string[]): Promise<void> {
+    await browser.waitUntil(
+        async () =>
+            JSON.stringify(await persistedS3Order()) === JSON.stringify(expected),
+        { timeout: 10_000, timeoutMsg: "S3 order did not persist to the backend" },
     );
 }
 

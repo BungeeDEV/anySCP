@@ -521,6 +521,26 @@ impl HostDb {
             tracing::info!("migration 13→14 applied: added saved_hosts.sort_order");
         }
 
+        if version < 15 {
+            // Extend manual drag-and-drop ordering to S3 connections, mirroring
+            // saved_hosts above. Idempotent column add; existing rows default to 0
+            // and fall back to the `label ASC` tiebreaker until reordered.
+            let has_sort_order: bool = conn
+                .prepare("SELECT sort_order FROM s3_connections LIMIT 0")
+                .is_ok();
+            if !has_sort_order {
+                conn.execute(
+                    "ALTER TABLE s3_connections ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', '15')",
+                [],
+            )?;
+            tracing::info!("migration 14→15 applied: added s3_connections.sort_order");
+        }
+
         Ok(())
     }
 
@@ -1638,7 +1658,7 @@ impl HostDb {
             .lock()
             .map_err(|e| DbError::InitError(format!("db lock poisoned: {e}")))?;
         let mut stmt = conn.prepare(
-            "SELECT id, label, provider, region, endpoint, bucket, path_style, group_id, color, environment, notes, created_at FROM s3_connections ORDER BY label"
+            "SELECT id, label, provider, region, endpoint, bucket, path_style, group_id, color, environment, notes, created_at FROM s3_connections ORDER BY sort_order ASC, label ASC"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(crate::s3::S3Connection {
@@ -1657,6 +1677,33 @@ impl HostDb {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Persist a manual S3-connection ordering. Assigns `sort_order = position`
+    /// for each id in `ordered_ids` inside a single transaction, mirroring
+    /// [`reorder_hosts`](Self::reorder_hosts). If any id does not match an
+    /// existing connection the whole transaction rolls back (leaving the previous
+    /// order intact) and `DbError::NotFound` is returned — guarding against a
+    /// stale frontend referencing a connection deleted concurrently.
+    #[instrument(skip(self), fields(count = ordered_ids.len()))]
+    pub fn reorder_s3_connections(&self, ordered_ids: &[String]) -> Result<(), DbError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| DbError::InitError(format!("db lock poisoned: {e}")))?;
+        let tx = conn.transaction()?;
+        for (idx, id) in ordered_ids.iter().enumerate() {
+            let affected = tx.execute(
+                "UPDATE s3_connections SET sort_order = ?2 WHERE id = ?1",
+                params![id, idx as i64],
+            )?;
+            if affected == 0 {
+                // Dropping `tx` without commit rolls back every prior UPDATE.
+                return Err(DbError::NotFound(id.clone()));
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn delete_s3_connection(&self, id: &str) -> Result<(), DbError> {
@@ -2659,5 +2706,66 @@ mod tests {
             after.folder_id.is_none(),
             "snippet should be orphaned after folder deletion"
         );
+    }
+
+    fn save_s3(db: &HostDb, id: &str, label: &str) {
+        db.save_s3_connection(
+            id,
+            label,
+            "aws",
+            "us-east-1",
+            None,
+            Some("my-bucket"),
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("save s3 connection");
+    }
+
+    #[test]
+    fn reorder_s3_connections_persists_order() {
+        let (db, _dir) = test_db();
+        // Labels chosen so the default `label ASC` order is alpha, bravo, charlie.
+        save_s3(&db, "a", "alpha");
+        save_s3(&db, "b", "bravo");
+        save_s3(&db, "c", "charlie");
+
+        let ids = |db: &HostDb| {
+            db.list_s3_connections()
+                .expect("list")
+                .into_iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&db), vec!["a", "b", "c"], "default order is label ASC");
+
+        db.reorder_s3_connections(&["c".into(), "a".into(), "b".into()])
+            .expect("reorder");
+        assert_eq!(ids(&db), vec!["c", "a", "b"], "new order persists");
+    }
+
+    #[test]
+    fn reorder_s3_connections_rolls_back_on_unknown_id() {
+        let (db, _dir) = test_db();
+        save_s3(&db, "a", "alpha");
+        save_s3(&db, "b", "bravo");
+
+        // "ghost" doesn't exist → the whole transaction must roll back, leaving
+        // the prior order (and the valid "b" update) untouched.
+        let err = db
+            .reorder_s3_connections(&["b".into(), "ghost".into()])
+            .expect_err("unknown id must error");
+        assert!(matches!(err, DbError::NotFound(id) if id == "ghost"));
+
+        let ids = db
+            .list_s3_connections()
+            .expect("list")
+            .into_iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["a", "b"], "order unchanged after rollback");
     }
 }

@@ -129,6 +129,7 @@ export const useS3Store = create<S3State>((set) => ({
 if (typeof window !== "undefined") {
   const w = window as unknown as {
     __e2eDeleteS3Connection?: (id: string) => Promise<void>;
+    __e2eS3Order?: () => Promise<string[]>;
     __e2eS3Upload?: (sessionId: string, localPath: string, key: string) => Promise<void>;
     __e2eS3Download?: (sessionId: string, key: string, localPath: string) => Promise<void>;
     __e2eS3UploadFiles?: (sessionId: string, localPaths: string[], prefix: string) => Promise<number>;
@@ -136,6 +137,13 @@ if (typeof window !== "undefined") {
   w.__e2eDeleteS3Connection = async (id) => {
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("s3_delete_connection", { id });
+  };
+  // Persisted connection order (labels) — lets the reorder E2E spec confirm the
+  // async backend write landed before relaunching to verify it survives a restart.
+  w.__e2eS3Order = async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const conns = await invoke<{ label: string }[]>("s3_list_connections");
+    return conns.map((c) => c.label);
   };
   w.__e2eS3Upload = async (sessionId, localPath, key) => {
     const { invoke } = await import("@tauri-apps/api/core");
