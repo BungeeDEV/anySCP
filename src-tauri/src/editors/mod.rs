@@ -501,6 +501,57 @@ pub fn resolve_default() -> Option<EditorConfig> {
         .or_else(|| detected.into_iter().next())
 }
 
+// ─── Temp staging ─────────────────────────────────────────────────────────────
+
+/// Build a collision-free local path for editing a remote file.
+///
+/// `key` uniquely identifies the remote file (e.g. session id + remote path or
+/// S3 bucket + key); `file_name` is the basename shown to the editor.
+///
+/// All edits used to land in a flat `anyscp-edit/<file_name>`, so two remote
+/// files sharing a basename — `a/compose.yml` and `b/compose.yml` — mapped to
+/// the same local file. With both open in an editor, saving one re-uploaded its
+/// contents to the *other's* remote path (#76). We namespace each download as
+/// `anyscp-edit/<group>/<unique>/<file_name>`:
+///
+/// - `<group>` is a hash of `key`, so all edits of one remote file land in the
+///   same readable group dir (useful when debugging the temp tree).
+/// - `<unique>` is a fresh UUID per call. It isolates every edit session, which
+///   buys two things the hash alone can't: a second edit of the *same* remote
+///   file gets its own dir (so one save-watcher's cleanup can't delete the file
+///   out from under another), and two distinct keys that happen to collide in
+///   the 64-bit group hash still never share a file.
+///
+/// The original `file_name` is kept innermost so the editor shows the right name
+/// and syntax highlighting.
+pub fn edit_temp_path(key: &str, file_name: &str) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    let group = format!("{:016x}", hasher.finish());
+    let unique = uuid::Uuid::new_v4().to_string();
+    std::env::temp_dir()
+        .join("anyscp-edit")
+        .join(group)
+        .join(unique)
+        .join(file_name)
+}
+
+/// Remove a staged edit file and prune the now-empty directories it lived in,
+/// stopping at (and never removing) the shared `anyscp-edit` root. Best-effort:
+/// a non-empty dir — e.g. a concurrent edit of the same remote file still in its
+/// own sibling dir — simply halts the walk, leaving the rest in place.
+pub fn edit_temp_cleanup(local_path: &Path) {
+    let _ = std::fs::remove_file(local_path);
+    let mut dir = local_path.parent();
+    while let Some(d) = dir {
+        if d.ends_with("anyscp-edit") || std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+}
+
 // ─── Launching ──────────────────────────────────────────────────────────────
 
 /// Launch `editor` against `file`. Spawns and returns immediately (the caller's
@@ -665,6 +716,70 @@ mod tests {
         assert!(none.is_empty());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn edit_temp_path_separates_same_basename() {
+        // Same basename under different remote dirs must not collide (#76).
+        let a = edit_temp_path("sess1\0/a/compose.yml", "compose.yml");
+        let b = edit_temp_path("sess1\0/b/compose.yml", "compose.yml");
+        assert_ne!(a, b);
+        assert_eq!(a.file_name().unwrap(), "compose.yml");
+        assert_eq!(b.file_name().unwrap(), "compose.yml");
+        // Every call is isolated, so even the *same* key yields a distinct dir
+        // (a second edit of one file can't clobber the first, and a hash
+        // collision can't make two files share a file path).
+        let a2 = edit_temp_path("sess1\0/a/compose.yml", "compose.yml");
+        assert_ne!(a, a2);
+        assert_eq!(a2.file_name().unwrap(), "compose.yml");
+        // Namespaced under anyscp-edit/<group>/<unique>/<file>.
+        let group = a.parent().unwrap().parent().unwrap();
+        assert!(group.parent().unwrap().ends_with("anyscp-edit"));
+        // The two edits of the same key share a group dir but differ in <unique>.
+        assert_eq!(group, a2.parent().unwrap().parent().unwrap());
+        assert_ne!(a.parent().unwrap(), a2.parent().unwrap());
+    }
+
+    #[test]
+    fn edit_temp_cleanup_prunes_dirs_but_keeps_root() {
+        let path = edit_temp_path("sess-cleanup\0/x/file.txt", "file.txt");
+        let unique_dir = path.parent().unwrap().to_path_buf();
+        let group_dir = unique_dir.parent().unwrap().to_path_buf();
+        let root = group_dir.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&unique_dir).unwrap();
+        std::fs::write(&path, b"hi").unwrap();
+
+        edit_temp_cleanup(&path);
+
+        assert!(!path.exists(), "file removed");
+        assert!(!unique_dir.exists(), "per-edit dir pruned");
+        assert!(!group_dir.exists(), "empty group dir pruned");
+        assert!(root.ends_with("anyscp-edit"));
+        // Root is never removed even once emptied.
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn edit_temp_cleanup_halts_at_nonempty_group() {
+        // Two concurrent edits of the same remote file share a group dir.
+        let a = edit_temp_path("sess-concurrent\0/y/file.txt", "file.txt");
+        let b = edit_temp_path("sess-concurrent\0/y/file.txt", "file.txt");
+        let group = a.parent().unwrap().parent().unwrap().to_path_buf();
+        assert_eq!(group, b.parent().unwrap().parent().unwrap());
+        std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        // Cleaning up edit A must not touch edit B's still-live file.
+        edit_temp_cleanup(&a);
+        assert!(!a.exists(), "A's file removed");
+        assert!(!a.parent().unwrap().exists(), "A's per-edit dir pruned");
+        assert!(b.exists(), "B's file untouched");
+        assert!(group.exists(), "shared group dir kept while B lives");
+
+        std::fs::remove_dir_all(&group).ok();
     }
 
     #[test]
